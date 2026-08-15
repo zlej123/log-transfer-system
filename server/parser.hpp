@@ -24,8 +24,8 @@ class LogAnalyzer {
 public:
     // Hard bounds that keep memory usage constant even under hostile input.
     static constexpr std::size_t kMaxLineLen        = 64 * 1024; // 64 KiB per line
-    static constexpr std::size_t kMaxBucketEntries  = 200000;    // module x hour
-    static constexpr std::size_t kMaxErrorSamples   = 200;       // kept in RAM
+    static constexpr std::size_t kMaxBucketEntries  = 20000;    // module x hour
+    static constexpr std::size_t kMaxErrorSamples   = 50;       // kept in RAM
 
     // Feed the next chunk of raw bytes from the stream.
     void feed(const char* data, std::size_t len);

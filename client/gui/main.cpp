@@ -59,8 +59,12 @@ struct AppState {
     std::array<char, 128> host{};
     int port = static_cast<int>(lgx::kDefaultPort);
 
-    std::filesystem::path log_file;      // chosen by the file picker
-    std::filesystem::path temp_result;   // worker downloads here first
+    std::filesystem::path log_file;
+    std::filesystem::path temp_result;
+    std::filesystem::path ca_file = "certs/ca.crt";
+    std::filesystem::path client_cert = "certs/client.crt";
+    std::filesystem::path client_key = "certs/client.key";
+    std::array<char, 128> server_name{};
 
     lgx::Progress     prog;
     std::atomic<bool> cancel{false};
@@ -70,18 +74,27 @@ struct AppState {
     AppState()
     {
         std::snprintf(host.data(), host.size(), "127.0.0.1");
+        std::snprintf(server_name.data(), server_name.size(), "localhost");
+        std::array<wchar_t, 32768> local_app_data{};
+        const DWORD count = ::GetEnvironmentVariableW(
+            L"LOCALAPPDATA", local_app_data.data(),
+            static_cast<DWORD>(local_app_data.size()));
         std::error_code ec;
-        auto tmp = std::filesystem::temp_directory_path(ec);
-        if (ec) tmp = ".";
-        temp_result = tmp / "lgx_result.csv";
+        std::filesystem::path state_dir = count > 0 && count < local_app_data.size()
+            ? std::filesystem::path(local_app_data.data()) / "LGXLogTransfer"
+            : std::filesystem::temp_directory_path(ec) / "LGXLogTransfer";
+        std::filesystem::create_directories(state_dir, ec);
+        if (ec) state_dir = ".";
+        // Stable across GUI restarts so an interrupted upload finds its sidecar.
+        temp_result = state_dir / "result.csv";
     }
     ~AppState() { stop_worker(); }
 
     bool busy() const
     {
         const lgx::Stage st = prog.get_stage();
-        return st == lgx::Stage::Connecting || st == lgx::Stage::Uploading ||
-               st == lgx::Stage::WaitingResult || st == lgx::Stage::Downloading;
+        return st != lgx::Stage::Idle && st != lgx::Stage::Done &&
+               st != lgx::Stage::Failed && st != lgx::Stage::Cancelled;
     }
 
     void stop_worker()
@@ -99,8 +112,13 @@ struct AppState {
         const std::uint16_t p = static_cast<std::uint16_t>(port);
         const std::filesystem::path in = log_file;
         const std::filesystem::path out = temp_result;
-        worker = std::thread([this, h, p, in, out] {
-            lgx::run_transfer(h, p, in, out, prog, cancel);
+        const std::filesystem::path ca = ca_file;
+        const std::filesystem::path cert = client_cert;
+        const std::filesystem::path key = client_key;
+        const std::string expected = server_name.data();
+        worker = std::thread([this, h, p, in, out, ca, cert, key, expected] {
+            lgx::run_transfer(h, p, in, out, prog, cancel,
+                              ca, expected, cert, key);
         });
     }
 };
@@ -117,6 +135,22 @@ void pick_log_file(HWND owner, AppState& app)
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (::GetOpenFileNameW(&ofn) == TRUE)
         app.log_file = std::filesystem::path(buf);
+}
+
+void pick_certificate_file(HWND owner, std::filesystem::path& destination,
+                           const wchar_t* title)
+{
+    wchar_t buf[MAX_PATH] = L"";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrTitle = title;
+    ofn.lpstrFilter = L"Certificate/key files\0*.crt;*.pem;*.key\0All files\0*.*\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (::GetOpenFileNameW(&ofn) == TRUE)
+        destination = std::filesystem::path(buf);
 }
 
 void save_result_as(HWND owner, AppState& app)
@@ -144,8 +178,11 @@ const char* stage_label(lgx::Stage s)
 {
     switch (s) {
     case lgx::Stage::Idle:          return "Idle";
+    case lgx::Stage::Hashing:       return "Computing source SHA-256...";
     case lgx::Stage::Connecting:    return "Connecting...";
-    case lgx::Stage::Uploading:     return "Uploading log file...";
+    case lgx::Stage::TlsHandshake:  return "TLS 1.3 mutual authentication...";
+    case lgx::Stage::Negotiating:   return "Negotiating resume offset...";
+    case lgx::Stage::Uploading:     return "Uploading encrypted log stream...";
     case lgx::Stage::WaitingResult: return "Server is analyzing (parsing 500MB stream)...";
     case lgx::Stage::Downloading:   return "Downloading result.csv...";
     case lgx::Stage::Done:          return "Done - analysis result received";
@@ -179,6 +216,18 @@ void draw_app_window(HWND hwnd, AppState& app)
     ImGui::InputInt("Port", &app.port);
     if (app.port < 1) app.port = 1;
     if (app.port > 65535) app.port = 65535;
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputText("TLS server name", app.server_name.data(),
+                     app.server_name.size());
+    if (ImGui::Button("CA..."))
+        pick_certificate_file(hwnd, app.ca_file, L"Select server CA certificate");
+    ImGui::SameLine(); ImGui::TextDisabled("%s", app.ca_file.string().c_str());
+    if (ImGui::Button("Client cert..."))
+        pick_certificate_file(hwnd, app.client_cert, L"Select client certificate");
+    ImGui::SameLine(); ImGui::TextDisabled("%s", app.client_cert.string().c_str());
+    if (ImGui::Button("Client key..."))
+        pick_certificate_file(hwnd, app.client_key, L"Select client private key");
+    ImGui::SameLine(); ImGui::TextDisabled("%s", app.client_key.string().c_str());
 
     // --- file picker --------------------------------------------------------
     ImGui::Spacing();
@@ -197,7 +246,9 @@ void draw_app_window(HWND hwnd, AppState& app)
 
     // --- upload -------------------------------------------------------------
     ImGui::Spacing();
-    ImGui::BeginDisabled(busy || app.log_file.empty());
+    ImGui::BeginDisabled(busy || app.log_file.empty() ||
+                         app.server_name[0] == '\0' || app.ca_file.empty() ||
+                         app.client_cert.empty() || app.client_key.empty());
     if (ImGui::Button("Upload & Analyze", ImVec2(180, 36)))
         app.start_transfer();
     ImGui::EndDisabled();
@@ -213,13 +264,25 @@ void draw_app_window(HWND hwnd, AppState& app)
     const lgx::Stage st = app.prog.get_stage();
     ImGui::Text("Status: %s", stage_label(st));
 
+    const std::uint64_t hashed = app.prog.hashed.load();
+    const std::uint64_t htotal = app.prog.hash_total.load();
+    const float hash_fraction = htotal ? static_cast<float>(
+        static_cast<double>(hashed) / static_cast<double>(htotal)) : 0.0f;
+    char hash_overlay[96];
+    std::snprintf(hash_overlay, sizeof(hash_overlay), "SHA-256 %.1f%%",
+                  hash_fraction * 100.0f);
+    ImGui::ProgressBar(hash_fraction, ImVec2(-1, 0), hash_overlay);
+
     const std::uint64_t sent = app.prog.sent.load();
     const std::uint64_t stot = app.prog.send_total.load();
     const float upf = stot ? static_cast<float>(
         static_cast<double>(sent) / static_cast<double>(stot)) : 0.0f;
     char overlay[96];
-    std::snprintf(overlay, sizeof(overlay), "Upload %.1f%%  (%.1f / %.1f MB)",
+    std::snprintf(overlay, sizeof(overlay),
+                  "Upload %.1f%% (resumed %.1f MB, %.1f / %.1f MB)",
                   upf * 100.0f,
+                  static_cast<double>(app.prog.resumed_offset.load()) /
+                      (1024.0 * 1024.0),
                   static_cast<double>(sent) / (1024.0 * 1024.0),
                   static_cast<double>(stot) / (1024.0 * 1024.0));
     ImGui::ProgressBar(upf, ImVec2(-1, 0), overlay);
@@ -278,7 +341,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     HWND hwnd = ::CreateWindowW(
         wc.lpszClassName, L"Log Transfer Client (C++ / Dear ImGui)",
         WS_OVERLAPPEDWINDOW, 100, 100,
-        static_cast<int>(720 * main_scale), static_cast<int>(480 * main_scale),
+        static_cast<int>(820 * main_scale), static_cast<int>(700 * main_scale),
         nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd)) {

@@ -21,5 +21,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ---
-Third-party: third_party/imgui is Dear ImGui, distributed under its own MIT
-license (see third_party/imgui/LICENSE.txt).
+Third-party notices:
+- third_party/imgui is Dear ImGui under the MIT license
+  (see third_party/imgui/LICENSE.txt).
+- third_party/mbedtls is Mbed TLS 3.6.4 under Apache License 2.0
+  (see third_party/mbedtls/LICENSE).

@@ -15,6 +15,11 @@ namespace {
 inline bool is_digit(char c) { return c >= '0' && c <= '9'; }
 
 inline int two_digits(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
+inline int four_digits(const char* p)
+{
+    return (p[0] - '0') * 1000 + (p[1] - '0') * 100 +
+           (p[2] - '0') * 10 + (p[3] - '0');
+}
 
 // Strict timestamp check: "[YYYY-MM-DD HH:MM:SS.mmm]" at s[0..24].
 // Returns true and fills `hour_key` with "YYYY-MM-DD HH" on success.
@@ -29,14 +34,21 @@ bool check_timestamp(const char* s, std::size_t n, std::string& hour_key)
         s[14] != ':' || s[17] != ':' || s[20] != '.' || s[24] != ']')
         return false;
 
+    const int year  = four_digits(s + 1);
     const int month = two_digits(s + 6);
     const int day   = two_digits(s + 9);
     const int hour  = two_digits(s + 12);
     const int min   = two_digits(s + 15);
     const int sec   = two_digits(s + 18);
-    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+    static constexpr int kMonthDays[] =
+        {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1 || month > 12 || day < 1 ||
         hour > 23 || min > 59 || sec > 59)
         return false;
+    int max_day = kMonthDays[month];
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (month == 2 && leap) ++max_day;
+    if (day > max_day) return false;
 
     hour_key.assign(s + 1, 13); // "YYYY-MM-DD HH"
     return true;
@@ -146,6 +158,10 @@ void LogAnalyzer::feed(const char* data, std::size_t len)
                 process_line(carry_.data(), carry_.size());
             }
             carry_.clear();
+        } else if (line_end - i > kMaxLineLen) {
+            ++total_lines_;
+            mark_malformed(data + i, std::min(line_end - i, std::size_t(64)),
+                           "line exceeds max length");
         } else {
             process_line(data + i, line_end - i);
         }
@@ -166,9 +182,11 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
 {
     // Tolerate CRLF input.
     if (n > 0 && s[n - 1] == '\r') --n;
-    if (n == 0) return; // blank line: ignore silently
-
     ++total_lines_;
+    if (n == 0) {
+        mark_malformed(s, n, "blank line");
+        return;
+    }
 
     std::string hour_key;
     if (!check_timestamp(s, n, hour_key)) {
@@ -199,7 +217,11 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
         mark_malformed(s, n, "bad module field");
         return;
     }
-    if (off < n && s[off] == ' ') ++off; // optional space before message
+    if (off >= n || s[off] != ' ') {
+        mark_malformed(s, n, "missing separator after module");
+        return;
+    }
+    ++off;
 
     // ---- Task 2 first: extract speed from lines containing "spd" --------
     // (validated before Task 1 so a corrupt line never pollutes any table)
@@ -207,10 +229,17 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     const std::size_t msg_len = n - off;
     bool has_spd = false;
     for (std::size_t i = 0; i + 3 <= msg_len; ++i) {
-        if (msg[i] == 's' && msg[i + 1] == 'p' && msg[i + 2] == 'd') {
-            has_spd = true;
-            break;
-        }
+        if (!(msg[i] == 's' && msg[i + 1] == 'p' && msg[i + 2] == 'd'))
+            continue;
+        const bool left_ok = i == 0 ||
+            !((msg[i - 1] >= 'A' && msg[i - 1] <= 'Z') ||
+              (msg[i - 1] >= 'a' && msg[i - 1] <= 'z') ||
+              is_digit(msg[i - 1]) || msg[i - 1] == '_');
+        const bool right_ok = i + 3 == msg_len ||
+            !((msg[i + 3] >= 'A' && msg[i + 3] <= 'Z') ||
+              (msg[i + 3] >= 'a' && msg[i + 3] <= 'z') ||
+              is_digit(msg[i + 3]) || msg[i + 3] == '_');
+        if (left_ok && right_ok) { has_spd = true; break; }
     }
     double spd_val = 0.0;
     if (has_spd && !parse_speed(msg, msg_len, spd_val)) {
@@ -252,30 +281,45 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
 
 bool LogAnalyzer::parse_speed(const char* msg, std::size_t n, double& out) const
 {
-    // Find "spd" followed by optional spaces, '=' or ':', optional spaces,
-    // then a finite decimal number within a sane physical range.
+    std::size_t field_count = 0;
+    double parsed = 0.0;
     for (std::size_t i = 0; i + 3 <= n; ++i) {
-        if (!(msg[i] == 's' && msg[i + 1] == 'p' && msg[i + 2] == 'd')) continue;
+        if (!(msg[i] == 's' && msg[i + 1] == 'p' && msg[i + 2] == 'd'))
+            continue;
+        const bool left_ok = i == 0 ||
+            !((msg[i - 1] >= 'A' && msg[i - 1] <= 'Z') ||
+              (msg[i - 1] >= 'a' && msg[i - 1] <= 'z') ||
+              is_digit(msg[i - 1]) || msg[i - 1] == '_');
+        const bool right_ok = i + 3 == n ||
+            !((msg[i + 3] >= 'A' && msg[i + 3] <= 'Z') ||
+              (msg[i + 3] >= 'a' && msg[i + 3] <= 'z') ||
+              is_digit(msg[i + 3]) || msg[i + 3] == '_');
+        if (!left_ok || !right_ok) continue;
+        ++field_count;
+        if (field_count > 1) return false; // ambiguous duplicate fields
         std::size_t j = i + 3;
         while (j < n && msg[j] == ' ') ++j;
-        if (j >= n || (msg[j] != '=' && msg[j] != ':')) continue;
+        if (j >= n || (msg[j] != '=' && msg[j] != ':')) return false;
         ++j;
         while (j < n && msg[j] == ' ') ++j;
         if (j >= n) return false;
 
-        double v = 0.0;
-        const auto res = std::from_chars(msg + j, msg + n, v);
-        if (res.ec != std::errc()) return false;
-        // Reject trailing junk glued to the number (e.g. "spd=12.3x7").
-        if (res.ptr < msg + n) {
-            const char t = *res.ptr;
-            if (t != ' ' && t != ',' && t != ';' && t != '\t') return false;
+        double value = 0.0;
+        const auto result = std::from_chars(msg + j, msg + n, value);
+        if (result.ec != std::errc()) return false;
+        if (result.ptr < msg + n) {
+            const char trailing = *result.ptr;
+            if (trailing != ' ' && trailing != ',' && trailing != ';' &&
+                trailing != '\t')
+                return false;
         }
-        if (!std::isfinite(v) || v < -100000.0 || v > 100000.0) return false;
-        out = v;
-        return true;
+        if (!std::isfinite(value) || value < -100000.0 || value > 100000.0)
+            return false;
+        parsed = value;
     }
-    return false;
+    if (field_count != 1) return false;
+    out = parsed;
+    return true;
 }
 
 void LogAnalyzer::mark_malformed(const char* s, std::size_t n, const char* reason)

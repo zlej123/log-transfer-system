@@ -113,9 +113,14 @@ void test_overlong_line_bounded_memory()
     // 100 KiB single "line" must be discarded without being buffered.
     std::string big(100 * 1024, 'A');
     big += '\n';
-    const auto a = run(big + kOk1, /*chunk=*/4096);
-    CHECK_EQ(a.valid_lines(), 1u);
-    CHECK_EQ(a.malformed_lines(), 1u);
+    const std::string input = big + kOk1;
+    const auto chunked = run(input, /*chunk=*/4096);
+    const auto one_shot = run(input);
+    CHECK_EQ(chunked.valid_lines(), 1u);
+    CHECK_EQ(chunked.malformed_lines(), 1u);
+    CHECK_EQ(one_shot.valid_lines(), 1u);
+    CHECK_EQ(one_shot.malformed_lines(), 1u);
+    CHECK(chunked.make_csv() == one_shot.make_csv());
 }
 
 void test_chunk_boundary_equivalence()
@@ -153,6 +158,32 @@ void test_spd_variants()
     CHECK(csv.find("max_speed,100.000000") != std::string::npos);
 }
 
+void test_calendar_blank_and_field_grammar()
+{
+    const auto a = run(
+        "[2026-02-31 08:00:00.000] [INFO] [M] x\n"
+        "[2025-02-29 08:00:00.000] [INFO] [M] x\n"
+        "[2024-02-29 08:00:00.000] [INFO] [M] x\n"
+        "[2026-04-31 08:00:00.000] [INFO] [M] x\n"
+        "\n"
+        "[2026-02-14 08:00:00.000] [INFO] [M]spd=1\n");
+    CHECK_EQ(a.total_lines(), 6u);
+    CHECK_EQ(a.valid_lines(), 1u);       // the leap-day line
+    CHECK_EQ(a.malformed_lines(), 5u);
+}
+
+void test_spd_boundaries_and_duplicates()
+{
+    const auto a = run(
+        "[2026-02-14 08:00:00.000] [INFO] [M] has_spd_marker only\n"
+        "[2026-02-14 08:00:00.000] [INFO] [M] xspd=99 telemetry\n"
+        "[2026-02-14 08:00:00.000] [INFO] [M] spd=1 spd=BAD\n"
+        "[2026-02-14 08:00:00.000] [INFO] [M] spd=12.5 ok\n");
+    CHECK_EQ(a.valid_lines(), 3u);       // two unrelated strings + one field
+    CHECK_EQ(a.malformed_lines(), 1u);   // ambiguous duplicate
+    CHECK(a.make_csv().find("spd_line_count,1") != std::string::npos);
+}
+
 void test_aggregate_table_hard_cap()
 {
     // Hostile input inventing endless unique modules must hit the cap
@@ -182,6 +213,8 @@ int main()
     test_overlong_line_bounded_memory();
     test_chunk_boundary_equivalence();
     test_spd_variants();
+    test_calendar_blank_and_field_grammar();
+    test_spd_boundaries_and_duplicates();
     test_aggregate_table_hard_cap();
 
     if (g_failures == 0) {

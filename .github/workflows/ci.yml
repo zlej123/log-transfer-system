@@ -16,7 +16,7 @@ jobs:
           set -e
           HITS=$(grep -rnwE 'new|delete|malloc|free|calloc|realloc' \
                    server client common tools tests \
-                   --include='*.cpp' --include='*.hpp' \
+                   --include='*.c' --include='*.cc' --include='*.cpp' --include='*.cxx' --include='*.h' --include='*.hpp' \
                  | grep -vE '= delete;' \
                  | grep -vE 'freeaddrinfo' || true)
           if [ -n "$HITS" ]; then
@@ -48,10 +48,27 @@ jobs:
           cmake -S . -B build-asan -DENABLE_ASAN=ON
           cmake --build build-asan -j"$(nproc)"
       - name: ctest under sanitizers (leak == test failure)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: cd build-asan && ctest --output-on-failure
 
+  linux-tsan:
+    name: ThreadSanitizer concurrency tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: TSan build
+        run: |
+          cmake -S . -B build-tsan -DENABLE_TSAN=ON
+          cmake --build build-tsan -j"$(nproc)"
+      - name: ctest under ThreadSanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: cd build-tsan && ctest --output-on-failure
+
   windows-cross:
-    name: Windows GUI client (zig cross-compile)
+    name: Windows GUI + CLI clients (zig cross-compile)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,5 +81,7 @@ jobs:
         run: ./scripts/build_windows_client.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: log_client_gui-windows-x64
-          path: dist/windows/log_client_gui.exe
+          name: log-transfer-clients-windows-x64
+          path: |
+            dist/windows/log_client_gui.exe
+            dist/windows/log_client_cli.exe

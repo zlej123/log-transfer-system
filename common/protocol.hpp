@@ -1,4 +1,4 @@
-// protocol.hpp - shared wire protocol definitions (little-endian framing)
+// protocol.hpp - shared LGX2 wire framing (network byte order)
 // STRICT RULE COMPLIANT: header-only RAII and STL storage.
 #pragma once
 
@@ -8,60 +8,81 @@
 #include <vector>
 #include <array>
 
+#include "hash.hpp"
+
 namespace lgx {
 
 // ---------------------------------------------------------------------------
-// Wire protocol
+// TLS-protected wire protocol v2
 //
-//   Request  (client -> server):
-//     [u32 magic 'LGX1'][u8 cmd][u8 flags][u16 name_len][u64 payload_size]
-//     [name_len bytes: file name (UTF-8)]
-//     [payload_size bytes: raw file stream]
+//   Upload initialization (client -> server):
+//     [header: cmd=UPLOAD_INIT, payload_size=complete file size]
+//     [UTF-8 file name][32-byte SHA-256][32-byte resume token]
 //
-//   Response (server -> client):
-//     same fixed header layout, cmd = RESULT_CSV or ERROR_TEXT,
-//     payload = result.csv bytes (or UTF-8 error message).
+//   Resume response (server -> client):
+//     [header: cmd=RESUME_INFO, payload_size=accepted byte offset]
+//     [32-byte opaque resume token]
+//
+//   The client streams bytes [offset, file_size). The server persists a
+//   bounded-memory partial file, verifies SHA-256, analyzes it in chunks, and
+//   replies with RESULT_CSV followed by name, result SHA-256 and CSV bytes.
+//   ERROR_TEXT carries a bounded UTF-8 payload and a stable error code.
 // ---------------------------------------------------------------------------
 
-constexpr std::uint32_t kMagic = 0x3158474Cu; // "LGX1" little-endian
+constexpr std::uint32_t kMagic = 0x4C475832u; // ASCII "LGX2"
 constexpr std::uint16_t kDefaultPort = 45777;
 
 enum class Cmd : std::uint8_t {
-    UploadLog = 1, // client -> server: here comes a log file
-    ResultCsv = 2, // server -> client: analysis result (result.csv)
-    ErrorText = 3, // server -> client: human readable failure reason
+    UploadInit  = 1,
+    ResumeInfo = 2,
+    ResultCsv  = 3,
+    ErrorText  = 4,
+};
+
+enum class ErrorCode : std::uint8_t {
+    None = 0,
+    Protocol = 1,
+    ResumeInvalid = 2,
+    ChecksumMismatch = 3,
+    ServerBusy = 4,
+    Storage = 5,
+    Internal = 6,
 };
 
 constexpr std::size_t   kHeaderSize     = 16;                    // fixed part
+constexpr std::size_t   kResumeTokenSize = 32;
+constexpr std::size_t   kUploadMetaSize  = kSha256Size + kResumeTokenSize;
 constexpr std::uint16_t kMaxNameLen     = 1024;                  // sanity cap
 constexpr std::uint64_t kMaxPayloadSize = 8ull * 1024 * 1024 * 1024; // 8 GiB cap
+constexpr std::uint64_t kMaxResultSize  = 64ull * 1024 * 1024;
+constexpr std::uint64_t kMaxErrorSize   = 1024;
 constexpr std::size_t   kChunkSize      = 64 * 1024;             // stream chunk
 
 struct FrameHeader {
     std::uint32_t magic = kMagic;
-    Cmd           cmd   = Cmd::UploadLog;
+    Cmd           cmd   = Cmd::UploadInit;
     std::uint8_t  flags = 0;
     std::uint16_t name_len = 0;
     std::uint64_t payload_size = 0;
 };
 
-// Serialize header into a fixed byte array (explicit little-endian, portable).
+// Serialize a fixed network-byte-order header.
 inline std::array<unsigned char, kHeaderSize> encode_header(const FrameHeader& h)
 {
     std::array<unsigned char, kHeaderSize> b{};
     auto put32 = [&](std::size_t off, std::uint32_t v) {
         for (int i = 0; i < 4; ++i) b[off + static_cast<std::size_t>(i)] =
-            static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+            static_cast<unsigned char>((v >> (8 * (3 - i))) & 0xFF);
     };
     auto put64 = [&](std::size_t off, std::uint64_t v) {
         for (int i = 0; i < 8; ++i) b[off + static_cast<std::size_t>(i)] =
-            static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+            static_cast<unsigned char>((v >> (8 * (7 - i))) & 0xFF);
     };
     put32(0, h.magic);
     b[4] = static_cast<unsigned char>(h.cmd);
     b[5] = h.flags;
-    b[6] = static_cast<unsigned char>(h.name_len & 0xFF);
-    b[7] = static_cast<unsigned char>((h.name_len >> 8) & 0xFF);
+    b[6] = static_cast<unsigned char>((h.name_len >> 8) & 0xFF);
+    b[7] = static_cast<unsigned char>(h.name_len & 0xFF);
     put64(8, h.payload_size);
     return b;
 }
@@ -71,18 +92,25 @@ inline bool decode_header(const unsigned char* b, std::size_t len, FrameHeader& 
 {
     if (b == nullptr || len < kHeaderSize) return false;
     std::uint32_t magic = 0;
-    for (int i = 3; i >= 0; --i) magic = (magic << 8) | b[i];
+    for (int i = 0; i < 4; ++i) magic = (magic << 8) | b[i];
     if (magic != kMagic) return false;
 
     const std::uint8_t cmd = b[4];
-    if (cmd < static_cast<std::uint8_t>(Cmd::UploadLog) ||
+    if (cmd < static_cast<std::uint8_t>(Cmd::UploadInit) ||
         cmd > static_cast<std::uint8_t>(Cmd::ErrorText)) return false;
+    if (cmd == static_cast<std::uint8_t>(Cmd::ErrorText)) {
+        if (b[5] == 0 ||
+            b[5] > static_cast<std::uint8_t>(ErrorCode::Internal)) return false;
+    } else if (b[5] != 0) {
+        return false;
+    }
 
-    std::uint16_t name_len = static_cast<std::uint16_t>(b[6] | (b[7] << 8));
+    std::uint16_t name_len = static_cast<std::uint16_t>((b[6] << 8) | b[7]);
     if (name_len > kMaxNameLen) return false;
 
     std::uint64_t sz = 0;
-    for (int i = 7; i >= 0; --i) sz = (sz << 8) | b[8 + static_cast<std::size_t>(i)];
+    for (int i = 0; i < 8; ++i)
+        sz = (sz << 8) | b[8 + static_cast<std::size_t>(i)];
     if (sz > kMaxPayloadSize) return false;
 
     out.magic = magic;

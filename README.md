@@ -2,245 +2,372 @@
 
 [![CI](https://github.com/zlej123/log-transfer-system/actions/workflows/ci.yml/badge.svg)](https://github.com/zlej123/log-transfer-system/actions/workflows/ci.yml)
 
-A cross-platform client-server system that uploads a large (~500 MB) virtual
-device log file from a **Windows client** to a **Linux server** over raw
-TCP/IP, parses and analyzes it **while it is being received** (streaming),
-and returns the aggregated statistics back to the client as `result.csv`.
+A production-oriented C++17 client/server application that securely transfers
+large virtual-device logs from Windows to Linux, verifies their integrity,
+parses them with bounded memory, and returns an atomically published CSV.
 
-| Component | Tech |
+## Highlights
+
+- **Mutual TLS 1.3** with certificate-chain validation, server hostname
+  verification, an authorized client subject, and mandatory ALPN `lgx/2`.
+  There is no plaintext or LGX1 downgrade path.
+- **Persistent upload resume** with a server-generated 256-bit opaque token.
+  A disconnect or server restart continues from the server's authoritative
+  durably committed manifest offset rather than retransmitting the prefix.
+- **End-to-end SHA-256** for the complete input and returned CSV. Parsing never
+  starts until the complete spool passes verification; a result is staged and
+  atomically replaces the destination only after its size and digest match.
+- **Fixed-size bounded thread pool**, bounded admission queue, queue-age limit,
+  per-session deadlines, same-upload exclusive lease, disk reservation quota,
+  partial-count cap and stale-state TTL.
+- **Streaming analysis** with one reusable 64 KiB buffer. The 500 MiB file is
+  never loaded into memory.
+- **Poison-line containment**: malformed records are counted and skipped while
+  processing continues. Payload samples are disabled by default.
+- **Windows GUI** in C++17 with Dear ImGui/Win32/DirectX 11. Hashing, DNS/TCP,
+  TLS, resume negotiation, upload and download all execute on a worker thread.
+- No prohibited manual-allocation/deallocation keyword token appears anywhere
+  in first-party C++ source, including comments.
+
+## Components
+
+| Component | Technology |
 |---|---|
-| Server (Linux) | C++17, Berkeley sockets, thread-per-connection, daemon mode |
-| GUI Client (Windows) | C++17, Dear ImGui (Win32 + DirectX 11), worker-thread async I/O |
-| CLI Client (Linux/Windows) | C++17, same transfer engine as the GUI (used for automated E2E tests) |
-| Test log generator | C++17, deterministic, injects ~0.001% poisoned lines |
+| Linux server | C++17, Berkeley sockets, `signalfd`/`poll`, bounded worker pool |
+| Windows GUI | C++17, Dear ImGui, Win32, DirectX 11 |
+| CLI client | Same cross-platform C++17 transfer engine as the GUI |
+| TLS / SHA-256 | Vendored Mbed TLS 3.6.4 (Apache-2.0) |
+| Test log generator | Deterministic C++17 generator with ~0.001% poison lines |
 
----
+## Quick start
 
-## 1. Repository layout
+### 1. Build on Linux
 
-```
-common/protocol.hpp        shared wire-protocol framing (header-only)
-server/main.cpp            TCP daemon: accept loop, connection handling
-server/net.hpp             RAII socket + robust send_all/recv_all helpers
-server/parser.{hpp,cpp}    streaming LogAnalyzer (Task1/Task2 + poison handling)
-client/core/transfer.hpp   cross-platform worker-thread transfer engine
-client/gui/main.cpp        Dear ImGui Win32/DX11 GUI client
-client/cli/main.cpp        headless CLI client (testing / automation)
-tools/loggen.cpp           500 MB test-log generator (0.001% corrupted lines)
-tests/test_parser.cpp      dependency-free unit tests for the streaming parser
-tests/run_e2e.sh           automated end-to-end + robustness test script
-scripts/build_linux.sh     builds server + CLI client + loggen
-scripts/build_windows_client.sh   cross-compiles the Windows GUI .exe with zig
-third_party/imgui/         vendored Dear ImGui (unmodified)
-dist/                      pre-built binaries (Linux + Windows)
-```
-
-## 2. Build instructions
-
-### 2.1 Linux (server, CLI client, log generator)
-
-Requirements: `g++` >= 9 (C++17), `cmake` >= 3.16.
+Requirements: CMake 3.16+, a C++17 compiler, Python 3 (vendored Mbed TLS
+configuration), POSIX threads, and the `openssl` CLI for test certificates. TLS libraries are vendored.
 
 ```bash
 ./scripts/build_linux.sh
-# or manually:
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
 ```
 
-Produces `build/log_server`, `build/log_client_cli`, `build/loggen`.
+This creates:
 
-Optional sanitizer build (used for the leak-free verification):
+- `build/log_server`
+- `build/log_client_cli`
+- `build/loggen`
+
+### 2. Generate local test PKI material
 
 ```bash
-cmake -S . -B build-asan -DENABLE_ASAN=ON && cmake --build build-asan -j
+./scripts/generate_test_certs.sh certs
 ```
 
-### 2.2 Windows GUI client
+This produces a development CA plus server/client certificates. The server
+certificate contains `DNS:localhost` and `IP:127.0.0.1`; the client certificate
+has subject `CN=lgx-client` and `clientAuth` EKU.
 
-**Option A - cross-compile from Linux (how `dist/windows/*.exe` was built):**
+> The generated keys are for local testing only and are ignored by Git. Use
+> organization-managed PKI, protected key storage and a deliberate client
+> subject authorization policy in production.
+
+### 3. Start the server
+
+```bash
+./build/log_server \
+  --port 45777 \
+  --workdir server_work \
+  --cert certs/server.crt \
+  --key certs/server.key \
+  --client-ca certs/ca.crt \
+  --allowed-client-subject "CN=lgx-client" \
+  --threads 4 --queue 32
+```
+
+Daemon mode:
+
+```bash
+./build/log_server [same options] --daemon
+```
+
+The private work directory and upload store use mode `0700`; daemon-created
+files inherit mode `0600`. `server.pid` is removed during graceful shutdown.
+
+### 4. Generate and transfer a 500 MiB log
+
+```bash
+./build/loggen --out test_log_500mb.log --size-mb 500
+
+./build/log_client_cli 127.0.0.1 45777 test_log_500mb.log result.csv \
+  certs/ca.crt certs/client.crt certs/client.key localhost
+```
+
+CLI argument order:
+
+```text
+log_client_cli <host> <port> <log> [result] [ca] [client-cert] [client-key] [TLS-server-name]
+```
+
+The TLS server name is verified against the certificate SAN independently of
+the address used to connect. This allows, for example, connecting to a WSL IP
+while verifying the configured name `localhost` in a private test deployment.
+
+## Windows GUI client
+
+Run `dist/windows/log_client_gui.exe` and select:
+
+1. Server address and port
+2. TLS server name
+3. Server CA certificate
+4. Client certificate and private key
+5. Log file
+6. **Upload & Analyze**
+7. **Download Result (Save As...)**
+
+Separate progress bars show the source SHA-256 pass, encrypted upload (including
+the resumed offset), and verified result download. Closing or cancelling the
+window signals the worker; socket operations poll at one-second intervals and
+all owned resources are released through RAII.
+
+### Native Windows build
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022"
+cmake --build build --config Release --target log_client_gui log_client_cli
+```
+
+### Linux-to-Windows cross-build
 
 ```bash
 # zig on PATH, or: pip install ziglang
 ./scripts/build_windows_client.sh
-# -> dist/windows/log_client_gui.exe  (PE32+ GUI, statically linked, no DLLs needed)
 ```
 
-**Option B - native build on Windows (Visual Studio 2019+):**
+Mbed TLS is linked into the executables, so separate TLS DLLs are not required.
 
-```bat
-cmake -S . -B build -G "Visual Studio 17 2022"
-cmake --build build --config Release --target log_client_gui
+## Architecture
+
+```text
+Windows client                                  Linux daemon
+┌──────────────────────────────┐                ┌─────────────────────────────┐
+│ GUI thread                   │                │ poll(listener, signalfd)    │
+│  reads atomic progress       │                │       │ try_submit          │
+│           ▲                  │  mTLS 1.3      │       ▼                     │
+│ worker thread                ├───────────────►│ bounded queue (Q)           │
+│  SHA-256 source pass         │                │       ▼                     │
+│  resume negotiation          │                │ fixed workers (N)           │
+│  stream suffix               │                │  private .part spool        │
+│  verify result + atomic move │◄───────────────┤  SHA verify + stream parse  │
+└──────────────────────────────┘                └─────────────────────────────┘
 ```
 
-## 3. Running
+### Bounded concurrency and shutdown
 
-```bash
-# server (foreground)
-./build/log_server --port 45777 --workdir server_work
-# server (background daemon: double-fork + setsid, logs to workdir/server.log,
-#         pid written to workdir/server.pid)
-./build/log_server --port 45777 --workdir server_work --daemon
+The old detached-thread-per-connection model has been replaced by an owning
+`BoundedThreadPool`:
 
-# generate the 500 MB test log (contains ~0.001% intentionally corrupt lines)
-./build/loggen --out test_log_500mb.log --size-mb 500
+- fixed worker count (`--threads`, default 4)
+- fixed queue capacity (`--queue`, default 32)
+- non-blocking admission; overflow is immediately closed
+- queued sockets older than ten seconds are discarded
+- active sockets are held by shared connection-state ownership, preventing file
+  descriptor reuse races during shutdown
+- SIGINT/SIGTERM are consumed via `signalfd` in ordinary process context
+- shutdown closes admission, clears queued owners, calls `shutdown()` on active
+  sockets, and joins every worker before logger/store destruction
 
-# CLI client
-./build/log_client_cli <server-ip> 45777 test_log_500mb.log result.csv
+Server-side upload idle and absolute deadlines prevent a peer from retaining a
+worker indefinitely. The aggregate table is capped at 20,000 keys per job, and
+the pool bounds the process-wide multiplier.
+
+## LGX2 protocol
+
+Every application byte is inside mutually authenticated TLS 1.3 with negotiated
+ALPN `lgx/2`. The fixed 16-byte header uses network byte order:
+
+```text
+magic[4] = "LGX2"
+command:u8 | flags:u8 | name_length:u16 | payload_size:u64
 ```
 
-GUI client: run `log_client_gui.exe`, enter the server IP/port, **Select Log
-File...**, **Upload & Analyze** (live progress bars), then **Download Result
-(Save As...)** when finished.
+Unknown commands, reserved flags, names above 1024 bytes and payloads above
+8 GiB are rejected before payload processing.
 
-## 4. Network architecture
+### Upload / resume state machine
 
-```
- Windows client                                Linux server (daemon)
- ┌───────────────────────────┐                 ┌──────────────────────────────┐
- │ UI thread (Dear ImGui)    │                 │ accept() loop (main thread)  │
- │   reads atomic counters   │                 │        │ one thread per conn │
- │        ▲                  │    TCP/IP       │        ▼                     │
- │ worker std::thread ───────┼────────────────►│ recv 64 KiB chunk ──┐        │
- │   64 KiB file chunks      │                 │      ▲              ▼        │
- │   progress -> atomics     │◄────────────────┼── send result.csv  LogAnalyzer│
- └───────────────────────────┘                 └──────────────────── (streaming)┘
+```text
+Client                                      Server
+UPLOAD_INIT(size, name, SHA256, token)  ->  validate identity + quotas
+                                        <-  RESUME_INFO(offset, opaque token)
+seek(offset); stream [offset, size)      ->  append private spool
+                                        ->  recompute SHA256 over complete spool
+                                        ->  parse complete verified spool in 64 KiB chunks
+                                        <-  RESULT_CSV(name, SHA256, bytes)
+verify into staging file; atomic publish
 ```
 
-* **Framing** - a fixed 16-byte little-endian header
-  `[magic 'LGX1'][cmd][flags][name_len][payload_size]` followed by the file
-  name and the raw payload stream. The response reuses the same frame with
-  `cmd = RESULT_CSV`. Every header field is validated (magic, command range,
-  name/payload size caps) before any allocation-affecting action.
-* **Asynchronous client I/O** - the transfer runs entirely on a worker
-  `std::thread`; the UI thread only reads `std::atomic` progress counters,
-  so the window stays responsive during the whole 500 MB upload/download.
-* **Cancellable connect with timeout** - the client connects in
-  non-blocking mode and polls in 100 ms slices (10 s cap), so an
-  unreachable server can neither hang the worker for minutes nor block the
-  Cancel button.
-* **Server concurrency** - accept loop + one detached worker thread per
-  connection; every socket is an RAII object, and a per-connection guard
-  keeps an active-connection count for graceful shutdown (SIGTERM/SIGINT).
+An all-zero token creates a session. The server returns a cryptographically
+random 256-bit token, stored by the client in a restrictive sidecar (`0600`
+on POSIX; inherited user ACL on Windows) bound to the
+local file digest, TLS server name, port and CA-file digest. Server paths are derived only from the token, never the
+display filename. On reconnect:
 
-## 5. Memory optimization strategy
+- token, name, size and digest must all match the manifest
+- the server alone chooses the offset from the durable manifest checkpoint
+- only one connection may own a token; a contender receives `ServerBusy`
+- every 4 MiB checkpoint follows `fdatasync(spool)` -> synced manifest
+  staging -> atomic rename -> parent-directory `fsync`
+- restart recovery trusts only the manifest's committed offset and truncates any
+  uncommitted spool tail before accepting a suffix
+- completed uploads cache their result and its immutable digest, making retry
+  after a lost result response idempotent
+- a full-file digest mismatch discards the partial and invalidates the sidecar
 
-The server **never** holds the file in memory:
+Only spool bytes through the durable manifest offset are trusted. After any
+resume, the complete file is read
+from byte zero into a fresh analyzer, so parser carry/discard state cannot be
+omitted or counted twice at the resume boundary.
 
-1. Bytes are received into a single reusable **64 KiB chunk buffer**
-   (`std::vector<char>`, allocated once per connection).
-2. Each chunk is fed straight into the incremental `LogAnalyzer`, which only
-   keeps a partial-line carry (`std::string`) between chunks.
-3. Only bounded aggregates survive: `(module, hour) -> count` hash map,
-   speed sum/count/min/max, line counters, and at most 200 malformed-line
-   samples.
-4. Hostile input cannot grow memory: lines longer than **64 KiB** are
-   discarded in-flight without buffering, and the aggregate table is hard
-   capped (`kMaxBucketEntries`), so even a file full of garbage keeps the
-   footprint constant.
+Stable structured error codes distinguish protocol, resume, checksum, busy,
+storage and internal failures. See [`docs/protocol-v2.md`](docs/protocol-v2.md).
 
-**Measured**: peak RSS (`VmHWM`) of the server while receiving + parsing the
-real 500 MB file is **~4.2 MB** - well under the 50 MB recommendation.
-The full receive-and-parse pass completes in ~0.6 s on the test machine.
+## Integrity and atomic publication
 
-## 6. Poisoned-data (exception) handling algorithm
+1. The client hashes the same open input stream it subsequently uploads.
+2. The claimed SHA-256 is sent in `UPLOAD_INIT` inside mTLS.
+3. After exact-size receipt, the server rereads the private spool in bounded
+   chunks and computes SHA-256 while feeding the parser.
+4. A mismatch is terminal for that session; no parser result is published.
+5. The server hashes the CSV and sends its digest before the CSV bytes.
+6. The client writes a token-scoped staging file, verifies size and digest, and
+   atomically replaces the requested result. A prior valid result survives a
+   failed or tampered download.
 
-The provided log contains ~0.001% deliberately corrupted lines. Parsing is a
-hand-written validating scanner (no exceptions on the hot path, no regex):
+NIST SHA-256 vectors (empty, `abc`, one million `a` bytes) and live source
+mutation are covered by automated tests.
 
-1. **Strict positional timestamp check** - `[YYYY-MM-DD HH:MM:SS.mmm]` with
-   per-character digit/separator validation plus range checks
-   (month 1-12, hour 0-23, ...). Catches missing brackets, truncated or
-   garbage timestamps.
-2. **Bracket token scanner** for `[LEVEL]` and `[Module]` with charset and
-   length limits - catches missing `]`, binary garbage, oversized tokens.
-3. **Speed extraction** with `std::from_chars` (locale-free, non-throwing):
-   requires `spd = <number>` / `spd: <number>`, rejects trailing junk
-   (`spd=12.3x`), non-finite values (`NaN`, `inf`) and absurd magnitudes.
-   A line that contains `spd` but no parsable value is treated as corrupt.
-4. Any failed stage -> the line is **counted, sampled (first 200, control
-   characters hex-escaped) into `workdir/parse_errors.log`, skipped**, and
-   parsing continues to the end of the stream. A `catch`-all around each
-   connection guarantees one bad stream can never bring the daemon down.
-5. Structural safety nets: 64 KiB max line length (over-long lines are
-   streamed to /dev/null, not buffered), capped aggregate tables, CRLF and
-   missing-final-newline tolerance.
+## Memory and storage bounds
 
-`result.csv` reports `total_lines / valid_lines / malformed_lines` so the
-poison ratio is fully auditable.
+- 64 KiB receive/read buffer per active connection
+- 64 KiB maximum logical log line; an oversized line is discarded without
+  accumulating its contents
+- 20,000 maximum module/hour aggregate keys per analyzer
+- 50 maximum poison samples retained in memory
+- bounded workers and queue
+- 8 GiB per-file protocol ceiling
+- 20 GiB default logical reservation quota (`--max-storage-gb`)
+- 100 active partials by default (`--max-partials`)
+- completed+partial manifest count capped relative to the partial quota
+- 24-hour stale cache/partial cleanup at startup and new-session admission
+  (`--resume-ttl-hours`)
 
-## 7. STRICT CODING RULES compliance
+Measured with the deterministic 500 MiB file:
 
-* **Zero whole-word token occurrences**, including comments, of every
-  prohibited manual-allocation/deallocation keyword in all first-party C++
-  sources (`server/`, `client/`, `common/`, `tools/`, `tests/`). Unique
-  ownership is enforced with private, intentionally undefined copy members;
-  `::freeaddrinfo` is a distinct POSIX networking API and is wrapped in an
-  RAII holder.
-* All buffers are `std::vector`/`std::string`/`std::array`; sockets, file
-  descriptors, Winsock lifetime, `addrinfo` results, worker threads and the
-  connection counter are all RAII objects - every early-return / error path
-  releases its resources automatically.
-* Verified leak-free with AddressSanitizer + LeakSanitizer across normal
-  transfers, mid-transfer disconnects, and SIGTERM shutdown: **0 leaks**.
-* Third-party vendored code (`third_party/imgui`, unmodified upstream
-  Dear ImGui) manages its own memory internally and is outside the
-  first-party rule scope.
+| Measurement | Result |
+|---|---:|
+| Linux server peak RSS (`VmHWM`) | **5.1 MiB** |
+| Client peak RSS | **4.8 MiB** |
+| Full client operation (pre-hash + mTLS upload + verify/parse + result) | **5.6 s** |
+| Server SHA verification + streaming analysis | **1.67 s** |
+| Result correctness | byte-identical to the independent baseline |
 
-## 8. Robustness test matrix (all automated, all passing)
+## Poison-data algorithm
 
-| Scenario | Result |
-|---|---|
-| 500 MB upload -> parse -> result.csv round trip | OK, ~0.6 s, output verified against an independent Python reimplementation (100% match) |
-| Server peak memory during 500 MB stream | 4.2 MB (`VmHWM`) |
-| 59 poisoned lines in 6,185,997 | all 59 detected, skipped, logged; zero crashes |
-| Client SIGKILL at ~30% of upload | server logs `connection lost mid-upload`, frees resources, keeps serving |
-| Random garbage bytes sent to the port | rejected at header validation, connection dropped |
-| Server SIGKILL mid-upload | client exits gracefully with a clear error (no crash) |
-| ASan/LSan build, incl. aborted transfers | 0 errors, 0 leaks |
-| Daemon mode | detached session (`setsid`), pid file, file logging, clean SIGTERM stop |
-| Empty file / file without trailing newline | handled correctly |
-| Connect to unroutable address | fails fast (10 s cap), cancellable mid-connect |
-| Real Windows process -> WSL2 Linux server, 500 MB | result byte-identical to Linux-native run |
+Expected record:
 
-## 9. Automated tests & CI
+```text
+[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] message ... spd=12.34 ...
+```
+
+The hot path is a non-throwing validating scanner:
+
+- strict field positions and separators
+- real calendar validation, including leap-year/month-day rules
+- bounded alphabetic level and module charset
+- standalone `spd` token detection with duplicate-field rejection
+- locale-independent `std::from_chars`, finite/range/trailing-junk validation
+- chunk-invariant overlong-line rejection (including a complete oversized line
+  delivered in one network read)
+- CRLF and missing-final-newline support
+
+Malformed/blank/ambiguous lines increment the audit counters and are skipped.
+The first 50 sanitized samples exist in memory for diagnostics, but payload
+sample persistence requires the explicit `--log-poison-samples` option.
+
+## Automated verification
 
 ```bash
 cd build && ctest --output-on-failure
 ```
 
-* `parser_unit` - unit tests covering every poison category (missing
-  brackets, binary garbage, truncated timestamps, `spd=NaN??`, glued junk,
-  out-of-range values), CRLF / missing-final-newline, byte-by-byte chunk
-  boundary equivalence, the 64 KiB over-long-line guard and the aggregate
-  hard cap.
-* `e2e` - spins up a real server, uploads a generated poisoned log, checks
-  the returned CSV against the generator's ground truth, SIGKILLs a client
-  mid-upload, throws random garbage at the port, verifies deterministic
-  results afterwards, and asserts the client fails fast (<=15 s) on an
-  unroutable address.
+CTest includes:
 
-GitHub Actions runs four jobs on every push: forbidden-keyword scan,
-Release build + ctest, ASan/LSan build + ctest (a leak fails the build),
-and the zig cross-compile of the Windows GUI client.
+1. `parser_unit`: poison categories, calendar semantics, speed boundaries,
+   byte-by-byte chunk equivalence, both one-shot/chunked 100 KiB lines, hard
+   aggregate cap.
+2. `protocol_unit`: golden network-order frame, all truncated header lengths,
+   invalid magic/command/flags, filename sanitization and NIST SHA-256 vectors.
+3. `thread_pool_unit`: `N=2/Q=2` backpressure, worker maximum and bounded active
+   socket shutdown/join.
+4. `upload_store_unit`: completed-cache retry, persisted result digest
+   corruption rejection, manifest reload, uncommitted-tail truncation,
+   short-spool/missing-cache/stale-staging recovery, on-admission TTL cleanup,
+   deletion-failure retention and orphan charging.
+5. `e2e`: generated ephemeral PKI, mTLS success, wrong CA/name, empty server
+   identity, untrusted client and mismatched certificate/key rejection,
+   plaintext rejection, symlink/duplicate-workdir exclusion, live source
+   mutation, deterministic TLS fault injection, SIGKILL/restart resume,
+   simultaneous resume contention, lost-result cached retry, post-generation
+   cache tamper rejection, cooperative verify cancellation, accept-flood
+   SIGTERM, byte-identical baseline, and connect timeout.
 
-## 10. result.csv format
+GitHub Actions runs:
 
+- strict first-party source scan
+- Linux Release tests
+- ASan/UBSan + LeakSanitizer tests
+- ThreadSanitizer tests
+- Windows GUI + CLI zig cross-build
+
+The full E2E suite also passes under ASan/UBSan. TSan is run on the native Ubuntu
+CI runner; some WSL kernels cannot start its shadow-memory runtime.
+
+## Strict coding-rule compliance
+
+- First-party C++ source under `server/`, `client/`, `common/`, `tools/` and
+  `tests/` contains **zero whole-word occurrences** of every prohibited manual
+  allocation/deallocation token, including comments.
+- Buffers use `std::array`, `std::vector` and `std::string`.
+- Socket handles, TLS/X.509/key/RNG contexts, files, threads, queue tasks,
+  upload leases and temporary artifacts are immediately owned by RAII types.
+- Copying of unique owners is inaccessible; move semantics transfer ownership.
+- All early-return, exception, disconnect, cancellation and shutdown paths have
+  been exercised under sanitizers.
+- Vendored Dear ImGui and Mbed TLS are third-party projects governed by their
+  own licenses and excluded from the first-party keyword policy.
+
+## Repository layout
+
+```text
+common/protocol.hpp          LGX2 frame codec and validation
+common/hash.hpp              RAII SHA-256 helper
+common/tls.hpp               TLS 1.3/mTLS RAII transport
+server/main.cpp              signalfd accept loop, TLS handler, workflow
+server/thread_pool.hpp       bounded owning worker pool
+server/upload_store.hpp      token manifests, quotas, resume/cache leases
+server/parser.{hpp,cpp}      bounded incremental analyzer
+client/core/transfer.hpp     worker transfer/resume/integrity engine
+client/gui/main.cpp          Dear ImGui Win32/DX11 UI
+client/cli/main.cpp          automation/console client
+tools/loggen.cpp             deterministic large-log generator
+tests/                       unit, E2E and fault-injection tests
+scripts/                     Linux/Windows builds and test PKI generation
+third_party/imgui/           Dear ImGui source
+third_party/mbedtls/         Mbed TLS 3.6.4 source
+dist/                        prebuilt Linux and Windows binaries
+docs/protocol-v2.md          wire/state specification
 ```
-# Task1: event count per module grouped by hour
-module,hour,count
-Engine,2026-02-14 00,360407
-...
-# Task2: average speed over lines containing 'spd'
-metric,value
-spd_line_count,1855546
-average_speed,90.028523
-min_speed,0.000000
-max_speed,180.000000
-# Summary
-metric,value
-total_lines,6185997
-valid_lines,6185938
-malformed_lines,59
-bytes_processed,524288023
-```
+
+## License
+
+First-party code is MIT licensed. Dear ImGui is MIT licensed. Mbed TLS 3.6.4 is
+Apache-2.0 licensed; its license is included under `third_party/mbedtls/LICENSE`.

@@ -11,7 +11,8 @@
 int main(int argc, char** argv)
 {
     if (argc < 4) {
-        std::printf("usage: log_client_cli <host> <port> <logfile> [result_out]\n");
+        std::printf("usage: log_client_cli <host> <port> <logfile> [result_out] "
+                    "[ca.crt] [client.crt] [client.key] [server-name]\n");
         return 2;
     }
     const std::string host = argv[1];
@@ -20,6 +21,10 @@ int main(int argc, char** argv)
     const std::filesystem::path out_path =
         argc >= 5 ? std::filesystem::path(argv[4])
                   : std::filesystem::path("result.csv");
+    const std::filesystem::path ca_path = argc >= 6 ? argv[5] : "certs/ca.crt";
+    const std::filesystem::path cert_path = argc >= 7 ? argv[6] : "certs/client.crt";
+    const std::filesystem::path key_path = argc >= 8 ? argv[7] : "certs/client.key";
+    const std::string server_name = argc >= 9 ? argv[8] : "localhost";
     if (port <= 0 || port > 65535) {
         std::fprintf(stderr, "invalid port\n");
         return 2;
@@ -32,25 +37,30 @@ int main(int argc, char** argv)
     // the "UI" (here: the console) keeps refreshing independently.
     std::thread worker([&] {
         lgx::run_transfer(host, static_cast<std::uint16_t>(port),
-                          log_path, out_path, prog, cancel);
+                          log_path, out_path, prog, cancel,
+                          ca_path, server_name, cert_path, key_path);
     });
 
-    const char* stage_names[] = {"idle", "connecting", "uploading",
-                                 "waiting-result", "downloading",
-                                 "done", "failed", "cancelled"};
+    const char* stage_names[] = {"idle", "hashing", "connecting", "tls-handshake",
+                                 "negotiating", "uploading", "waiting-result",
+                                 "downloading", "done", "failed", "cancelled"};
     for (;;) {
         const lgx::Stage st = prog.get_stage();
+        const std::uint64_t hashed = prog.hashed.load();
+        const std::uint64_t htot = prog.hash_total.load();
         const std::uint64_t sent = prog.sent.load();
         const std::uint64_t stot = prog.send_total.load();
         const std::uint64_t rcv  = prog.received.load();
         const std::uint64_t rtot = prog.recv_total.load();
+        const double hp = htot ? 100.0 * static_cast<double>(hashed) /
+                                 static_cast<double>(htot) : 0.0;
         const double up = stot ? 100.0 * static_cast<double>(sent) /
                                  static_cast<double>(stot) : 0.0;
         const double dn = rtot ? 100.0 * static_cast<double>(rcv) /
                                  static_cast<double>(rtot) : 0.0;
-        std::printf("\r[%-14s] upload %6.2f%% (%llu/%llu)  download %6.2f%%   ",
-                    stage_names[static_cast<int>(st)], up,
-                    (unsigned long long)sent, (unsigned long long)stot, dn);
+        std::printf("\r[%-14s] hash %6.2f%% upload %6.2f%% (resume=%llu) download %6.2f%%   ",
+                    stage_names[static_cast<int>(st)], hp, up,
+                    (unsigned long long)prog.resumed_offset.load(), dn);
         std::fflush(stdout);
         if (st == lgx::Stage::Done || st == lgx::Stage::Failed ||
             st == lgx::Stage::Cancelled)
