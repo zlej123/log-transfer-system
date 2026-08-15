@@ -81,6 +81,113 @@ bool take_bracket_token(const char* s, std::size_t n, std::size_t& off,
     return true;
 }
 
+// Parse one numeric metadata token such as "[7710]".
+bool take_numeric_token(const char* s, std::size_t n, std::size_t& off,
+                        std::size_t max_digits)
+{
+    if (off >= n || s[off] != '[') return false;
+    std::size_t pos = off + 1;
+    const std::size_t start = pos;
+    while (pos < n && is_digit(s[pos])) {
+        if (pos - start >= max_digits) return false;
+        ++pos;
+    }
+    if (pos == start || pos >= n || s[pos] != ']') return false;
+    off = pos + 1;
+    return true;
+}
+
+// Actual assignment corpus:
+// [YYYY-MM-DD_HH:MM:SS.ffffff][id][tid][pid] BYDA::Module: message
+bool parse_byda_header(const char* s, std::size_t n, std::string& hour_key,
+                       std::string& module, std::size_t& message_offset)
+{
+    if (n < 29 || s[0] != '[' || s[27] != ']') return false;
+    static constexpr std::array<std::size_t, 20> digit_pos =
+        {1,2,3,4, 6,7, 9,10, 12,13, 15,16, 18,19, 21,22,23,24,25,26};
+    for (std::size_t pos : digit_pos)
+        if (!is_digit(s[pos])) return false;
+    if (s[5] != '-' || s[8] != '-' || s[11] != '_' || s[14] != ':' ||
+        s[17] != ':' || s[20] != '.')
+        return false;
+
+    const int year = four_digits(s + 1);
+    const int month = two_digits(s + 6);
+    const int day = two_digits(s + 9);
+    const int hour = two_digits(s + 12);
+    const int minute = two_digits(s + 15);
+    const int second = two_digits(s + 18);
+    static constexpr int kMonthDays[] =
+        {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 ||
+        minute > 59 || second > 59)
+        return false;
+    int max_day = kMonthDays[month];
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (month == 2 && leap) ++max_day;
+    if (day > max_day) return false;
+
+    hour_key.assign(s + 1, 10);
+    hour_key.push_back(' ');
+    hour_key.append(s + 12, 2);
+
+    std::size_t off = 28;
+    if (!take_numeric_token(s, n, off, 20) ||
+        !take_numeric_token(s, n, off, 20) ||
+        !take_numeric_token(s, n, off, 20) || off >= n || s[off] != ' ')
+        return false;
+    ++off;
+    static constexpr char kPrefix[] = "BYDA::";
+    static constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1;
+    if (off + kPrefixLen >= n ||
+        std::memcmp(s + off, kPrefix, kPrefixLen) != 0)
+        return false;
+    const std::size_t module_start = off;
+    off += kPrefixLen;
+    const std::size_t name_start = off;
+    if (name_start >= n ||
+        !((s[name_start] >= 'A' && s[name_start] <= 'Z') ||
+          (s[name_start] >= 'a' && s[name_start] <= 'z')))
+        return false;
+    while (off < n && s[off] != ':') {
+        const char c = s[off];
+        if (!(is_digit(c) || (c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') || c == '_' || c == '-' || c == '.') ||
+            off - name_start >= 64)
+            return false;
+        ++off;
+    }
+    if (off == name_start || off >= n || off + 2 >= n || s[off + 1] != ' ')
+        return false;
+    module.assign(s + module_start, off - module_start);
+    message_offset = off + 2;
+    return true;
+}
+
+// Known numeric payload fields are validated when they appear. This detects
+// alphabetic poison values without coupling the parser to a poison module name.
+bool validate_integer_field(const char* msg, std::size_t n,
+                            const char* label, std::size_t label_len)
+{
+    for (std::size_t i = 0; i + label_len <= n; ++i) {
+        if (std::memcmp(msg + i, label, label_len) != 0) continue;
+        if (i > 0) {
+            const char previous = msg[i - 1];
+            if (is_digit(previous) ||
+                (previous >= 'A' && previous <= 'Z') ||
+                (previous >= 'a' && previous <= 'z') || previous == '_')
+                continue;
+        }
+        std::size_t pos = i + label_len;
+        if (pos >= n || msg[pos] != '[') return false;
+        ++pos;
+        const std::size_t start = pos;
+        while (pos < n && is_digit(msg[pos])) ++pos;
+        if (pos == start || pos >= n || msg[pos] != ']') return false;
+    }
+    return true;
+}
+
 std::string escape_sample(const char* s, std::size_t n)
 {
     static constexpr std::size_t kMax = 120;
@@ -133,7 +240,7 @@ void LogAnalyzer::feed(const char* data, std::size_t len)
             std::memchr(data + i, '\n', len - i));
         if (nl == nullptr) {
             // No newline in the rest of this chunk: stash and wait for more.
-            if (carry_.size() + (len - i) > kMaxLineLen) {
+            if (len - i > kMaxLineLen - carry_.size()) {
                 ++total_lines_; // this over-long line is consumed right here
                 mark_malformed(carry_.data(),
                                std::min(carry_.size(), std::size_t(64)),
@@ -148,7 +255,7 @@ void LogAnalyzer::feed(const char* data, std::size_t len)
 
         const std::size_t line_end = static_cast<std::size_t>(nl - data);
         if (!carry_.empty()) {
-            if (carry_.size() + (line_end - i) > kMaxLineLen) {
+            if (line_end - i > kMaxLineLen - carry_.size()) {
                 ++total_lines_;
                 mark_malformed(carry_.data(),
                                std::min(carry_.size(), std::size_t(64)),
@@ -189,44 +296,54 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     }
 
     std::string hour_key;
-    if (!check_timestamp(s, n, hour_key)) {
-        mark_malformed(s, n, "bad timestamp / missing bracket");
-        return;
-    }
-
-    std::size_t off = 25;
-    if (off >= n || s[off] != ' ') {
-        mark_malformed(s, n, "missing separator after timestamp");
-        return;
-    }
-    ++off;
-
-    std::string level;
-    if (!take_bracket_token(s, n, off, level, 8, /*module_charset=*/false)) {
-        mark_malformed(s, n, "bad level field");
-        return;
-    }
-    if (off >= n || s[off] != ' ') {
-        mark_malformed(s, n, "missing separator after level");
-        return;
-    }
-    ++off;
-
     std::string module;
-    if (!take_bracket_token(s, n, off, module, 64, /*module_charset=*/true)) {
-        mark_malformed(s, n, "bad module field");
-        return;
+    std::size_t off = 0;
+    const bool byda_format = parse_byda_header(s, n, hour_key, module, off);
+    if (!byda_format) {
+        // Preserve the original generated/test format.
+        if (!check_timestamp(s, n, hour_key)) {
+            mark_malformed(s, n, "bad timestamp / missing bracket");
+            return;
+        }
+        off = 25;
+        if (off >= n || s[off] != ' ') {
+            mark_malformed(s, n, "missing separator after timestamp");
+            return;
+        }
+        ++off;
+        std::string level;
+        if (!take_bracket_token(s, n, off, level, 8, false) ||
+            off >= n || s[off] != ' ') {
+            mark_malformed(s, n, "bad level field");
+            return;
+        }
+        ++off;
+        if (!take_bracket_token(s, n, off, module, 64, true) ||
+            off >= n || s[off] != ' ') {
+            mark_malformed(s, n, "bad module field");
+            return;
+        }
+        ++off;
     }
-    if (off >= n || s[off] != ' ') {
-        mark_malformed(s, n, "missing separator after module");
-        return;
-    }
-    ++off;
 
     // ---- Task 2 first: extract speed from lines containing "spd" --------
     // (validated before Task 1 so a corrupt line never pollutes any table)
     const char* msg = s + off;
     const std::size_t msg_len = n - off;
+    if (byda_format) {
+        for (std::size_t i = 0; i < msg_len; ++i) {
+            const unsigned char value = static_cast<unsigned char>(msg[i]);
+            if (value < 0x20 || value > 0x7E) {
+                mark_malformed(s, n, "non-printable payload byte");
+                return;
+            }
+        }
+        if (!validate_integer_field(msg, msg_len, "nodeUID", 7) ||
+            !validate_integer_field(msg, msg_len, "rfLane", 6)) {
+            mark_malformed(s, n, "invalid numeric payload field");
+            return;
+        }
+    }
     bool has_spd = false;
     for (std::size_t i = 0; i + 3 <= msg_len; ++i) {
         if (!(msg[i] == 's' && msg[i + 1] == 'p' && msg[i + 2] == 'd'))
@@ -242,7 +359,7 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
         if (left_ok && right_ok) { has_spd = true; break; }
     }
     double spd_val = 0.0;
-    if (has_spd && !parse_speed(msg, msg_len, spd_val)) {
+    if (has_spd && !parse_speed(msg, msg_len, spd_val, byda_format)) {
         // Line claims to carry a speed but the value is corrupted.
         mark_malformed(s, n, "unparsable spd value");
         return;
@@ -279,7 +396,8 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     ++valid_lines_;
 }
 
-bool LogAnalyzer::parse_speed(const char* msg, std::size_t n, double& out) const
+bool LogAnalyzer::parse_speed(const char* msg, std::size_t n, double& out,
+                              bool byda_format) const
 {
     std::size_t field_count = 0;
     double parsed = 0.0;
@@ -296,24 +414,51 @@ bool LogAnalyzer::parse_speed(const char* msg, std::size_t n, double& out) const
               is_digit(msg[i + 3]) || msg[i + 3] == '_');
         if (!left_ok || !right_ok) continue;
         ++field_count;
-        if (field_count > 1) return false; // ambiguous duplicate fields
-        std::size_t j = i + 3;
-        while (j < n && msg[j] == ' ') ++j;
-        if (j >= n || (msg[j] != '=' && msg[j] != ':')) return false;
-        ++j;
-        while (j < n && msg[j] == ' ') ++j;
-        if (j >= n) return false;
+        if (field_count > 1) return false;
+
+        std::size_t pos = i + 3;
+        bool bracketed = false;
+        const char* number_end = msg + n;
+        std::size_t trailing_pos = n;
+        if (byda_format) {
+            if (pos >= n || msg[pos] != '[') return false;
+            bracketed = true;
+            const std::size_t value_start = ++pos;
+            std::size_t close = value_start;
+            while (close < n && msg[close] != ']') {
+                if (close - value_start >= 32) return false;
+                ++close;
+            }
+            if (close == value_start || close >= n) return false;
+            number_end = msg + close;
+            trailing_pos = close + 1;
+        } else {
+            while (pos < n && msg[pos] == ' ') ++pos;
+            if (pos >= n || (msg[pos] != '=' && msg[pos] != ':')) return false;
+            ++pos;
+            while (pos < n && msg[pos] == ' ') ++pos;
+            if (pos >= n) return false;
+        }
 
         double value = 0.0;
-        const auto result = std::from_chars(msg + j, msg + n, value);
+        const auto result = std::from_chars(msg + pos, number_end, value);
         if (result.ec != std::errc()) return false;
-        if (result.ptr < msg + n) {
+        if (bracketed) {
+            if (result.ptr != number_end) return false;
+            if (trailing_pos < n) {
+                const char trailing = msg[trailing_pos];
+                if (trailing != ' ' && trailing != ',' && trailing != ';' &&
+                    trailing != '\t')
+                    return false;
+            }
+        } else if (result.ptr < msg + n) {
             const char trailing = *result.ptr;
             if (trailing != ' ' && trailing != ',' && trailing != ';' &&
                 trailing != '\t')
                 return false;
         }
-        if (!std::isfinite(value) || value < -100000.0 || value > 100000.0)
+        const double limit = byda_format ? 1000000.0 : 100000.0;
+        if (!std::isfinite(value) || value < -limit || value > limit)
             return false;
         parsed = value;
     }

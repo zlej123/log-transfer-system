@@ -37,7 +37,7 @@ parses them with bounded memory, and returns an atomically published CSV.
 | Windows GUI | C++17, Dear ImGui, Win32, DirectX 11 |
 | CLI client | Same cross-platform C++17 transfer engine as the GUI |
 | TLS / SHA-256 | Vendored Mbed TLS 3.6.4 (Apache-2.0) |
-| Test log generator | Deterministic C++17 generator with ~0.001% poison lines |
+| Test log generator | Deterministic C++17 regression-data generator |
 
 ## Quick start
 
@@ -260,30 +260,35 @@ mutation are covered by automated tests.
 - 24-hour stale cache/partial cleanup at startup and new-session admission
   (`--resume-ttl-hours`)
 
-Measured with the deterministic 500 MiB file:
+Measured with the supplied `BYDA_Test_Log_500MB.log` (506,286,814 bytes):
 
 | Measurement | Result |
 |---|---:|
-| Linux server peak RSS (`VmHWM`) | **5.1 MiB** |
-| Client peak RSS | **4.8 MiB** |
-| Full client operation (pre-hash + mTLS upload + verify/parse + result) | **5.6 s** |
-| Server SHA verification + streaming analysis | **1.67 s** |
-| Result correctness | byte-identical to the independent baseline |
+| Linux server peak RSS (`VmHWM`) | **≤ 5.2 MiB** |
+| Client peak RSS | **≤ 4.7 MiB** |
+| Full client operation (pre-hash + mTLS upload + verify/parse + result) | **6.7–9.34 s** |
+| Server SHA verification + streaming analysis | **2.09–2.25 s** |
+| Parsed records | **3,483,502 valid / 26 malformed** |
+| Speed records | **580,661; average 137,500.000000** |
+| Result correctness | all **125 module/hour buckets** equal an independent streaming oracle |
 
 ## Poison-data algorithm
 
-Expected record:
+Supported records (the first is the supplied assignment corpus; the second
+keeps the original regression-data format compatible):
 
 ```text
-[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] message ... spd=12.34 ...
+[YYYY-MM-DD_HH:MM:SS.ffffff][id][tid][pid] BYDA::Module: ... spd[137500.0] ...
+[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] ... spd=12.34 ...
 ```
 
 The hot path is a non-throwing validating scanner:
 
 - strict field positions and separators
 - real calendar validation, including leap-year/month-day rules
-- bounded alphabetic level and module charset
-- standalone `spd` token detection with duplicate-field rejection
+- bounded numeric metadata and qualified `BYDA::Module` names
+- known typed BYDA payload fields (`nodeUID`, `rfLane`) validated as integers
+- dialect-specific standalone `spd` parsing with duplicate-field rejection
 - locale-independent `std::from_chars`, finite/range/trailing-junk validation
 - chunk-invariant overlong-line rejection (including a complete oversized line
   delivered in one network read)
@@ -301,9 +306,9 @@ cd build && ctest --output-on-failure
 
 CTest includes:
 
-1. `parser_unit`: poison categories, calendar semantics, speed boundaries,
-   byte-by-byte chunk equivalence, both one-shot/chunked 100 KiB lines, hard
-   aggregate cap.
+1. `parser_unit`: legacy and supplied BYDA grammars, poison categories,
+   calendar semantics, dialect-specific speed boundaries, byte-by-byte chunk
+   equivalence, both one-shot/chunked 100 KiB lines, hard aggregate cap.
 2. `protocol_unit`: golden network-order frame, all truncated header lengths,
    invalid magic/command/flags, filename sanitization and NIST SHA-256 vectors.
 3. `thread_pool_unit`: `N=2/Q=2` backpressure, worker maximum and bounded active

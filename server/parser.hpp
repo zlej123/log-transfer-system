@@ -3,8 +3,9 @@
 // The 500 MB log is NEVER held in memory: bytes are fed chunk-by-chunk as
 // they arrive from the socket, and only bounded aggregates are kept.
 //
-// Expected well-formed line:
-//   [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] message text ... spd=12.34 ...
+// Supported well-formed lines:
+//   [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] message ... spd=12.34 ...
+//   [YYYY-MM-DD_HH:MM:SS.ffffff][id][tid][pid] BYDA::Module: ... spd[value] ...
 //
 // ~0.001% of lines are intentionally corrupted (missing brackets, garbage
 // bytes, format mismatches). Every validation failure is contained: the
@@ -47,7 +48,8 @@ public:
 private:
     void process_line(const char* s, std::size_t n);
     void mark_malformed(const char* s, std::size_t n, const char* reason);
-    bool parse_speed(const char* msg, std::size_t n, double& out) const;
+    bool parse_speed(const char* msg, std::size_t n, double& out,
+                     bool byda_format) const;
 
     // --- streaming state -----------------------------------------------
     std::string carry_;                 // partial line between chunks

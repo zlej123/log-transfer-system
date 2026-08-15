@@ -184,6 +184,75 @@ void test_spd_boundaries_and_duplicates()
     CHECK(a.make_csv().find("spd_line_count,1") != std::string::npos);
 }
 
+
+void test_byda_assignment_format_and_poison()
+{
+    const std::string good =
+        "[2026-06-19_22:00:00.045000][7710][30482][1885246073] "
+        "BYDA::RadarTrackNodeState: nodeUID[47], rfLane[3], lockState[1->0]\n"
+        "[2026-06-19_22:00:00.620000][7710][30482][1885246073] "
+        "BYDA::BeamSteerCtrlUnitImpl: unitAddr[4181], spd[137500.000000], "
+        "advDelta[62750.000000]\n"
+        "[2026-06-20_01:00:00.155000][7710][30482][1885246073] "
+        "BYDA::DetectionTaskRunner: Sector Command: jobID[7710000000415], "
+        "command[RUN], sectorID[20641103], bearing[2]\n";
+    const std::string poison =
+        "[2026-06-19_22:15:00.000000] !@#$RAW_FRAME_GARBAGE%^&*()\n"
+        "2026-06-19_22:20:00.111111][7710][30482][1885246073] "
+        "BYDA::HeadBraceLoss: raw[9]\n"
+        "[2026-06-19_22:05:00.123456][7710][30482][1885246073 "
+        "BYDA::OpenBraceLeak: rfLane[3]\n"
+        "[2026-06-19_22:10:00.654321][7710][30482][1885246073] "
+        "BYDA::CorruptPayload: nodeUID[NONE], rfLane[X]\n"
+        "[2026-06-19_22:25:00.999999][7710][30482][1885246073] "
+        "BYDA::BeyondLimit: spd[888888888888888888888.88]\n";
+
+    const auto one = run(good + poison);
+    const auto tiny = run(good + poison, 1);
+    CHECK_EQ(one.total_lines(), 8u);
+    CHECK_EQ(one.valid_lines(), 3u);
+    CHECK_EQ(one.malformed_lines(), 5u);
+    CHECK(one.make_csv() == tiny.make_csv());
+    CHECK(one.make_csv().find(
+        "BYDA::RadarTrackNodeState,2026-06-19 22,1") != std::string::npos);
+    CHECK(one.make_csv().find(
+        "BYDA::DetectionTaskRunner,2026-06-20 01,1") != std::string::npos);
+    CHECK(one.make_csv().find("spd_line_count,1") != std::string::npos);
+    CHECK(one.make_csv().find("average_speed,137500.000000") !=
+          std::string::npos);
+}
+
+
+void test_byda_strict_boundaries()
+{
+    const auto a = run(
+        // Accepted boundary and an unrelated substring.
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd[1000000]\n"
+        "[2024-02-29_23:59:59.999999][1][2][3] BYDA::M: xspd marker\n"
+        // Wrong fractional precision, calendar, metadata, or module grammar.
+        "[2026-06-19_22:00:00.00000][1][2][3] BYDA::M: ok\n"
+        "[2025-02-29_22:00:00.000000][1][2][3] BYDA::M: ok\n"
+        "[2026-06-19_22:00:00.000000][-1][2][3] BYDA::M: ok\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::7M: ok\n"
+        "[0000-06-19_22:00:00.000000][1][2][3] BYDA::M: ok\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: \n"
+        // BYDA speed must use brackets, be unique, bounded, and complete.
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd = 1\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd[]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd[1000001]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd[1] spd[2]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: spd[1x]\n"
+        // Typed numeric payloads and printable bytes are enforced.
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: nodeUID[NONE]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: bad\x01" "byte\n");
+    CHECK_EQ(a.total_lines(), 15u);
+    CHECK_EQ(a.valid_lines(), 2u);
+    CHECK_EQ(a.malformed_lines(), 13u);
+    CHECK(a.make_csv().find("spd_line_count,1") != std::string::npos);
+    CHECK(a.make_csv().find("average_speed,1000000.000000") !=
+          std::string::npos);
+}
+
 void test_aggregate_table_hard_cap()
 {
     // Hostile input inventing endless unique modules must hit the cap
@@ -215,6 +284,8 @@ int main()
     test_spd_variants();
     test_calendar_blank_and_field_grammar();
     test_spd_boundaries_and_duplicates();
+    test_byda_assignment_format_and_poison();
+    test_byda_strict_boundaries();
     test_aggregate_table_hard_cap();
 
     if (g_failures == 0) {
