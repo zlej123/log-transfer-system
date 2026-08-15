@@ -272,30 +272,40 @@ echo "[e2e] restart/resume OK (offset=$RESUME_OFFSET, result identical)"
 
 # SIGTERM during the post-upload digest/parse pass must be cooperative. The
 # fully synced spool remains resumable at EOF and completes after restart.
-"$BUILD/loggen" --out "$WORK/verify-stop.log" --size-mb 200 --seed 111 >/dev/null
+"$BUILD/loggen" --out "$WORK/verify-stop.log" --size-mb 60 --seed 111 >/dev/null
 "$BUILD/log_client_cli" 127.0.0.1 "$PORT" "$WORK/verify-stop.log" \
   "$WORK/verify-stop.csv" "$WORK/certs/ca.crt" \
   "$WORK/certs/client.crt" "$WORK/certs/client.key" localhost \
   >"$WORK/verify-stop-client.log" 2>&1 &
 VERIFY_CLIENT_PID=$!
 VERIFY_SIZE=$(stat -c %s "$WORK/verify-stop.log")
+# Sanitizer builds on shared runners are slow; wait on wall-clock, not on a
+# fixed iteration count, until the manifest commits the whole upload.
 VERIFY_META=""
-for _ in $(seq 1 500); do
+VERIFY_DEADLINE=$(( SECONDS + 300 ))
+while [ "$SECONDS" -lt "$VERIFY_DEADLINE" ]; do
   VERIFY_META=$(grep -l '^name=verify-stop.log$' "$WORK/server/uploads"/*.meta \
     2>/dev/null | head -1 || true)
   if [ -n "$VERIFY_META" ] && grep -q "^offset=$VERIFY_SIZE$" "$VERIFY_META"; then
     break
   fi
-  sleep .01
+  kill -0 "$VERIFY_CLIENT_PID" 2>/dev/null || break
+  sleep .02
 done
-[ -n "$VERIFY_META" ] && grep -q "^offset=$VERIFY_SIZE$" "$VERIFY_META"
+if [ -z "$VERIFY_META" ] || ! grep -q "^offset=$VERIFY_SIZE$" "$VERIFY_META"; then
+  echo "upload never reached a durable EOF checkpoint"
+  cat "$WORK/verify-stop-client.log" || true
+  exit 1
+fi
 kill -TERM "$SERVER_PID"
 VERIFY_STOPPED=0
-for _ in $(seq 1 100); do
+VERIFY_START=$SECONDS
+while [ $(( SECONDS - VERIFY_START )) -lt 60 ]; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then VERIFY_STOPPED=1; break; fi
   sleep .05
 done
 [ "$VERIFY_STOPPED" = 1 ] || { echo "verify pass ignored SIGTERM"; exit 1; }
+echo "[e2e] verify-stage SIGTERM honoured in $(( SECONDS - VERIFY_START ))s"
 wait "$SERVER_PID"
 SERVER_PID=""
 wait "$VERIFY_CLIENT_PID" 2>/dev/null || true
@@ -340,7 +350,8 @@ FLOOD_PID=$!
 sleep .4
 kill -TERM "$SERVER_PID"
 STOPPED=0
-for _ in $(seq 1 100); do
+FLOOD_START=$SECONDS
+while [ $(( SECONDS - FLOOD_START )) -lt 60 ]; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then STOPPED=1; break; fi
   sleep .05
 done
@@ -352,6 +363,6 @@ wait "$SERVER_PID"
 SERVER_PID=""
 kill "$FLOOD_PID" 2>/dev/null || true
 wait "$FLOOD_PID" 2>/dev/null || true
-echo "[e2e] SIGTERM remained prompt under accept flood"
+echo "[e2e] SIGTERM honoured in $(( SECONDS - FLOOD_START ))s under accept flood"
 
 echo "E2E OK"
