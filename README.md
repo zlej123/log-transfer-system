@@ -1,5 +1,7 @@
 # Large Log Analysis & Transfer System
 
+[![CI](https://github.com/zlej123/log-transfer-system/actions/workflows/ci.yml/badge.svg)](https://github.com/zlej123/log-transfer-system/actions/workflows/ci.yml)
+
 A cross-platform client-server system that uploads a large (~500 MB) virtual
 device log file from a **Windows client** to a **Linux server** over raw
 TCP/IP, parses and analyzes it **while it is being received** (streaming),
@@ -25,6 +27,8 @@ client/core/transfer.hpp   cross-platform worker-thread transfer engine
 client/gui/main.cpp        Dear ImGui Win32/DX11 GUI client
 client/cli/main.cpp        headless CLI client (testing / automation)
 tools/loggen.cpp           500 MB test-log generator (0.001% corrupted lines)
+tests/test_parser.cpp      dependency-free unit tests for the streaming parser
+tests/run_e2e.sh           automated end-to-end + robustness test script
 scripts/build_linux.sh     builds server + CLI client + loggen
 scripts/build_windows_client.sh   cross-compiles the Windows GUI .exe with zig
 third_party/imgui/         vendored Dear ImGui (unmodified)
@@ -111,6 +115,10 @@ File...**, **Upload & Analyze** (live progress bars), then **Download Result
 * **Asynchronous client I/O** - the transfer runs entirely on a worker
   `std::thread`; the UI thread only reads `std::atomic` progress counters,
   so the window stays responsive during the whole 500 MB upload/download.
+* **Cancellable connect with timeout** - the client connects in
+  non-blocking mode and polls in 100 ms slices (10 s cap), so an
+  unreachable server can neither hang the worker for minutes nor block the
+  Cancel button.
 * **Server concurrency** - accept loop + one detached worker thread per
   connection; every socket is an RAII object, and a per-connection guard
   keeps an active-connection count for graceful shutdown (SIGTERM/SIGINT).
@@ -192,9 +200,31 @@ poison ratio is fully auditable.
 | ASan/LSan build, incl. aborted transfers | 0 errors, 0 leaks |
 | Daemon mode | detached session (`setsid`), pid file, file logging, clean SIGTERM stop |
 | Empty file / file without trailing newline | handled correctly |
+| Connect to unroutable address | fails fast (10 s cap), cancellable mid-connect |
 | Real Windows process -> WSL2 Linux server, 500 MB | result byte-identical to Linux-native run |
 
-## 9. result.csv format
+## 9. Automated tests & CI
+
+```bash
+cd build && ctest --output-on-failure
+```
+
+* `parser_unit` - unit tests covering every poison category (missing
+  brackets, binary garbage, truncated timestamps, `spd=NaN??`, glued junk,
+  out-of-range values), CRLF / missing-final-newline, byte-by-byte chunk
+  boundary equivalence, the 64 KiB over-long-line guard and the aggregate
+  hard cap.
+* `e2e` - spins up a real server, uploads a generated poisoned log, checks
+  the returned CSV against the generator's ground truth, SIGKILLs a client
+  mid-upload, throws random garbage at the port, verifies deterministic
+  results afterwards, and asserts the client fails fast (<=15 s) on an
+  unroutable address.
+
+GitHub Actions runs four jobs on every push: forbidden-keyword scan,
+Release build + ctest, ASan/LSan build + ctest (a leak fails the build),
+and the zig cross-compile of the Windows GUI client.
+
+## 10. result.csv format
 
 ```
 # Task1: event count per module grouped by hour

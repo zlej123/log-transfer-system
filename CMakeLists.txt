@@ -61,3 +61,16 @@ if(WIN32)
     target_link_options(log_client_gui PRIVATE -municode -mwindows)
   endif()
 endif()
+
+# ------------------------------------------------------------------ tests
+enable_testing()
+add_executable(test_parser
+  tests/test_parser.cpp
+  server/parser.cpp)
+add_test(NAME parser_unit COMMAND test_parser)
+if(NOT WIN32)
+  add_test(NAME e2e
+    COMMAND bash ${CMAKE_SOURCE_DIR}/tests/run_e2e.sh
+            $<TARGET_FILE_DIR:log_server>)
+  set_tests_properties(e2e PROPERTIES TIMEOUT 120)
+endif()

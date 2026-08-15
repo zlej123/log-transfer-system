@@ -16,9 +16,11 @@
   static constexpr lgx_socket_t kInvalidSock = INVALID_SOCKET;
 #else
   #include <arpa/inet.h>
+  #include <fcntl.h>
   #include <netdb.h>
   #include <netinet/in.h>
   #include <netinet/tcp.h>
+  #include <sys/select.h>
   #include <sys/socket.h>
   #include <unistd.h>
   #include <cerrno>
@@ -185,6 +187,72 @@ struct AddrInfoHolder {
     ~AddrInfoHolder() { if (res != nullptr) ::freeaddrinfo(res); }
 };
 
+inline bool set_nonblocking(lgx_socket_t s, bool nb)
+{
+#ifdef _WIN32
+    u_long mode = nb ? 1u : 0u;
+    return ::ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+    const int fl = ::fcntl(s, F_GETFL, 0);
+    if (fl < 0) return false;
+    return ::fcntl(s, F_SETFL, nb ? (fl | O_NONBLOCK)
+                                  : (fl & ~O_NONBLOCK)) >= 0;
+#endif
+}
+
+// Cancellable connect with a hard timeout. Polls in 100 ms slices so the
+// worker thread reacts to the Cancel button even while connecting to an
+// unreachable host (a plain blocking connect() can hang for ~2 minutes).
+inline bool connect_with_timeout(const ClientSocket& sock, const sockaddr* addr,
+                                 std::size_t addrlen, int timeout_ms,
+                                 const std::atomic<bool>& cancel)
+{
+    if (!set_nonblocking(sock.get(), true)) return false;
+
+    bool ok = false;
+    const int rc = ::connect(sock.get(), addr,
+                             static_cast<socklen_t>(addrlen));
+    if (rc == 0) {
+        ok = true; // connected instantly (e.g. localhost)
+    } else {
+#ifdef _WIN32
+        const bool in_progress = (::WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        const bool in_progress = (errno == EINPROGRESS);
+#endif
+        if (in_progress) {
+            for (int waited = 0; waited < timeout_ms; waited += 100) {
+                if (cancel.load(std::memory_order_relaxed)) break;
+                fd_set wset;
+                fd_set eset;
+                FD_ZERO(&wset);
+                FD_ZERO(&eset);
+                FD_SET(sock.get(), &wset);
+                FD_SET(sock.get(), &eset);
+                timeval tv{};
+                tv.tv_usec = 100 * 1000;
+                const int n = ::select(static_cast<int>(sock.get()) + 1,
+                                       nullptr, &wset, &eset, &tv);
+                if (n < 0) break;      // select failed - give up
+                if (n == 0) continue;  // still connecting - poll cancel flag
+                int err = 0;
+#ifdef _WIN32
+                int elen = sizeof(err);
+                ::getsockopt(sock.get(), SOL_SOCKET, SO_ERROR,
+                             reinterpret_cast<char*>(&err), &elen);
+#else
+                socklen_t elen = sizeof(err);
+                ::getsockopt(sock.get(), SOL_SOCKET, SO_ERROR, &err, &elen);
+#endif
+                ok = (err == 0);
+                break; // definitive answer either way
+            }
+        }
+    }
+    if (!set_nonblocking(sock.get(), false)) return false;
+    return ok;
+}
+
 } // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -238,12 +306,18 @@ inline bool run_transfer(const std::string& host, std::uint16_t port,
             lgx_socket_t s = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
             if (s == kInvalidSock) continue;
             sock.adopt(s);
-            if (::connect(sock.get(), p->ai_addr,
-                          static_cast<int>(p->ai_addrlen)) == 0) break;
+            if (connect_with_timeout(sock, p->ai_addr, p->ai_addrlen,
+                                     /*timeout_ms=*/10000, cancel)) break;
             sock.reset();
         }
+        if (cancel.load()) {
+            prog.set_error("cancelled by user");
+            prog.set_stage(Stage::Cancelled);
+            return false;
+        }
         if (!sock.valid()) {
-            prog.set_error("cannot connect to " + host + ":" + port_str);
+            prog.set_error("cannot connect to " + host + ":" + port_str +
+                           " (refused or 10s timeout)");
             prog.set_stage(Stage::Failed);
             return false;
         }
