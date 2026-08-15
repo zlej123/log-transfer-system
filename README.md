@@ -365,6 +365,7 @@ third_party/imgui/           Dear ImGui source
 third_party/mbedtls/         Mbed TLS 3.6.4 source
 dist/                        prebuilt Linux and Windows binaries
 docs/protocol-v2.md          wire/state specification
+docs/requirements-compliance.md  assignment requirement mapping (Korean)
 ```
 
 ## License
