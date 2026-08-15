@@ -5,3 +5,4 @@ server_work/
 result_client.csv
 *.log
 !third_party/**
+dist/windows/*.pdb
