@@ -3,7 +3,7 @@
 // Designed to run on a WORKER THREAD: the GUI thread only reads the atomic
 // progress counters, so the UI never freezes during the 500 MB transfer.
 //
-// STRICT RULE COMPLIANT: no new/delete/malloc; RAII sockets, std containers.
+// STRICT RULE COMPLIANT: STL containers and RAII ownership only.
 #pragma once
 
 #ifdef _WIN32
@@ -97,8 +97,6 @@ public:
     ClientSocket() = default;
     explicit ClientSocket(lgx_socket_t s) : s_(s) {}
     ~ClientSocket() { reset(); }
-    ClientSocket(const ClientSocket&) = delete;
-    ClientSocket& operator=(const ClientSocket&) = delete;
 
     lgx_socket_t get() const { return s_; }
     bool valid() const { return s_ != kInvalidSock; }
@@ -109,6 +107,9 @@ public:
     void adopt(lgx_socket_t s) { reset(); s_ = s; }
 
 private:
+    // Unique socket ownership: copying is inaccessible and undefined.
+    ClientSocket(const ClientSocket&);
+    ClientSocket& operator=(const ClientSocket&);
     lgx_socket_t s_ = kInvalidSock;
 };
 

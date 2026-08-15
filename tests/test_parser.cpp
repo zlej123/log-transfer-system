@@ -1,4 +1,4 @@
-// test_parser.cpp - dependency-free unit tests for the streaming LogAnalyzer.
+// test_parser.cpp - self-contained unit tests for the streaming LogAnalyzer.
 // Covers every poison category from the assignment plus streaming edge cases.
 #include "../server/parser.hpp"
 

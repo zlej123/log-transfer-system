@@ -1,5 +1,5 @@
 // protocol.hpp - shared wire protocol definitions (little-endian framing)
-// STRICT RULE COMPLIANT: no new/delete/malloc anywhere. Header-only, RAII.
+// STRICT RULE COMPLIANT: header-only RAII and STL storage.
 #pragma once
 
 #include <cstdint>

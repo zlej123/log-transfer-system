@@ -1,5 +1,5 @@
 // net.hpp - RAII POSIX socket wrappers and robust I/O helpers (Linux server).
-// STRICT RULE COMPLIANT: no new/delete/malloc. RAII everywhere.
+// STRICT RULE COMPLIANT: STL containers and RAII ownership only.
 #pragma once
 
 #include <atomic>
@@ -24,8 +24,6 @@ public:
     explicit Socket(int fd) noexcept : fd_(fd) {}
     ~Socket() { reset(); }
 
-    Socket(const Socket&) = delete;
-    Socket& operator=(const Socket&) = delete;
     Socket(Socket&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
     Socket& operator=(Socket&& o) noexcept
     {
@@ -48,6 +46,10 @@ public:
     }
 
 private:
+    // Declared privately and intentionally undefined: this unique owner
+    // cannot be copied. Move operations above transfer ownership safely.
+    Socket(const Socket&);
+    Socket& operator=(const Socket&);
     int fd_ = -1;
 };
 

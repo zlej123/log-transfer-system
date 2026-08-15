@@ -6,7 +6,7 @@
 // binary garbage, truncated fields, bad numbers) to exercise the server's
 // poison-data handling.
 //
-// STRICT RULE COMPLIANT: no new/delete/malloc.
+// STRICT RULE COMPLIANT: STL streams and containers own all resources.
 #include <array>
 #include <cinttypes>
 #include <cstdint>

@@ -4,7 +4,7 @@
 //   download button. The transfer runs on a dedicated WORKER THREAD, so the
 //   UI thread never blocks ("no freeze / not-responding" requirement).
 //
-// STRICT RULE COMPLIANT (application code): no new/delete/malloc; the
+// STRICT RULE COMPLIANT: first-party state uses STL and RAII; the
 // worker thread + RAII sockets come from client/core/transfer.hpp.
 #include "imgui.h"
 #include "imgui_impl_win32.h"

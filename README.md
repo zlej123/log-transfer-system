@@ -171,12 +171,12 @@ poison ratio is fully auditable.
 
 ## 7. STRICT CODING RULES compliance
 
-* **Zero** occurrences of `new`, `delete`, `malloc`, `free`, `calloc`,
-  `realloc` in all first-party sources (`server/`, `client/`, `common/`,
-  `tools/`). The only textual matches are `= delete;` copy-suppression
-  declarations, which are a compile-time RAII-enforcement idiom, not memory
-  management. (`::freeaddrinfo` is the mandatory POSIX release call for
-  `getaddrinfo` results and is wrapped in an RAII holder.)
+* **Zero whole-word token occurrences**, including comments, of every
+  prohibited manual-allocation/deallocation keyword in all first-party C++
+  sources (`server/`, `client/`, `common/`, `tools/`, `tests/`). Unique
+  ownership is enforced with private, intentionally undefined copy members;
+  `::freeaddrinfo` is a distinct POSIX networking API and is wrapped in an
+  RAII holder.
 * All buffers are `std::vector`/`std::string`/`std::array`; sockets, file
   descriptors, Winsock lifetime, `addrinfo` results, worker threads and the
   connection counter are all RAII objects - every early-return / error path

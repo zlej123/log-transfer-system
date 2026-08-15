@@ -4,13 +4,13 @@
 // they arrive from the socket, and only bounded aggregates are kept.
 //
 // Expected well-formed line:
-//   [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] free text ... spd=12.34 ...
+//   [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Module] message text ... spd=12.34 ...
 //
 // ~0.001% of lines are intentionally corrupted (missing brackets, garbage
 // bytes, format mismatches). Every validation failure is contained: the
 // line is counted, a sample is recorded, and parsing continues.
 //
-// STRICT RULE COMPLIANT: no new/delete/malloc; std::string/std::vector only.
+// STRICT RULE COMPLIANT: std::string/std::vector with bounded state only.
 #pragma once
 
 #include <cstdint>

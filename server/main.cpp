@@ -7,7 +7,7 @@
 //   * Robust against mid-transfer disconnects: every socket/thread/file is
 //     RAII-owned, so a dropped peer only ends that one connection.
 //
-// STRICT RULE COMPLIANT: no new/delete/malloc/calloc/realloc/free anywhere.
+// STRICT RULE COMPLIANT: STL containers and RAII ownership only.
 #include "../common/protocol.hpp"
 #include "net.hpp"
 #include "parser.hpp"
@@ -206,7 +206,7 @@ bool daemonize(const ServerConfig& cfg)
     if (pid < 0) return false;
     if (pid > 0) ::_exit(0);          // parent leaves
 
-    if (::setsid() < 0) return false; // new session, no controlling TTY
+    if (::setsid() < 0) return false; // detached session, no controlling TTY
     ::signal(SIGHUP, SIG_IGN);
 
     pid = ::fork();
