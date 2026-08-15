@@ -1,7 +1,7 @@
 # 기술과제 요구사항 대조표 (Requirements Compliance)
 
 원문: `기술 과제 - 대용량 로그 분석 및 전송 시스템 구축`
-대상 릴리스: [`v2.0.0`](https://github.com/zlej123/log-transfer-system/releases/tag/v2.0.0) (commit `8f2834f`)
+대상 릴리스: [`v2.1.0`](https://github.com/zlej123/log-transfer-system/releases/tag/v2.1.0)
 작성 기준일: 2026-08-15
 
 > README.md는 과제 요구사항에 따라 영문으로 유지하며, 본 문서는 요구사항 대조용 부속 문서입니다.
