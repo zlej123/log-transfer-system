@@ -89,6 +89,17 @@ Daemon mode:
 ./build/log_server [same options] --daemon
 ```
 
+Under systemd, prefer the supervised unit instead of `--daemon`:
+
+```bash
+sudo install -m 0644 packaging/systemd/log-transfer-server.service \
+    /etc/systemd/system/
+sudo systemctl enable --now log-transfer-server.service
+```
+
+See [`packaging/systemd/README.md`](packaging/systemd/README.md) for the service
+account, TLS material layout, sandbox settings and failure behavior.
+
 The private work directory and upload store use mode `0700`; daemon-created
 files inherit mode `0600`. `server.pid` is removed during graceful shutdown.
 
@@ -366,6 +377,7 @@ client/cli/main.cpp          automation/console client
 tools/loggen.cpp             deterministic large-log generator
 tests/                       unit, E2E and fault-injection tests
 scripts/                     Linux/Windows builds and test PKI generation
+packaging/systemd/           supervised service unit and deployment guide
 third_party/imgui/           Dear ImGui source
 third_party/mbedtls/         Mbed TLS 3.6.4 source
 dist/                        prebuilt Linux and Windows binaries

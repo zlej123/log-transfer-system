@@ -1,0 +1,66 @@
+[Unit]
+Description=LGX2 large log analysis and transfer server
+Documentation=https://github.com/zlej123/log-transfer-system
+After=network-online.target
+Wants=network-online.target
+
+# A permanent misconfiguration (missing or mismatched TLS material) must end in
+# a visible failed state instead of an endless restart loop that buries the
+# original error in the journal.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# Run in the foreground: systemd owns supervision, so the built-in --daemon
+# double fork is neither needed nor wanted here.
+Type=simple
+User=lgx
+Group=lgx
+ExecStart=/usr/local/bin/log_server \
+    --port 45777 \
+    --workdir /var/lib/log-transfer \
+    --cert /etc/log-transfer/server.crt \
+    --key /etc/log-transfer/server.key \
+    --client-ca /etc/log-transfer/ca.crt \
+    --allowed-client-subject "CN=lgx-client" \
+    --threads 4 --queue 32
+
+# The server drains its bounded pool on SIGTERM and leaves uploads resumable.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2s
+
+# systemd creates and owns the private upload store.
+StateDirectory=log-transfer
+StateDirectoryMode=0700
+UMask=0077
+
+# Least privilege: the service needs one TCP port and its state directory.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
