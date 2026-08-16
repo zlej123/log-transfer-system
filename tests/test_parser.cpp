@@ -253,6 +253,75 @@ void test_byda_strict_boundaries()
           std::string::npos);
 }
 
+
+void test_byda_payload_field_contract()
+{
+    // A longer field that merely starts with a declared name is a different
+    // field and must not be judged by the declared field's contract.
+    const auto ok = run(
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: rfLaneCount[3]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: nodeUIDList[NONE]\n");
+    CHECK_EQ(ok.valid_lines(), 2u);
+    CHECK_EQ(ok.malformed_lines(), 0u);
+
+    // Every declared integer field is enforced, not just the two that the
+    // supplied corpus happens to corrupt.
+    const auto bad = run(
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: nodeUID[NONE]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: rfLane[X]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: sectorID[NONE]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: jobID[GARBAGE]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: bearing[X]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: unitAddr[?]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: gatedFlag[Y]\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: element[N][0->1][4]\n");
+    CHECK_EQ(bad.valid_lines(), 0u);
+    CHECK_EQ(bad.malformed_lines(), 8u);
+}
+
+void test_control_bytes_rejected_in_both_dialects()
+{
+    const auto a = run(
+        "[2026-02-14 08:00:00.000] [INFO] [Engine] bad\x01" "payload\n"
+        "[2026-06-19_22:00:00.000000][1][2][3] BYDA::M: bad\x01" "payload\n"
+        "[2026-02-14 08:00:00.000] [INFO] [Engine] tab\there is fine\n");
+    CHECK_EQ(a.valid_lines(), 1u);
+    CHECK_EQ(a.malformed_lines(), 2u);
+}
+
+void test_aggregate_truncation_is_reported()
+{
+    lgx::LogAnalyzer a;
+    std::string line;
+    const std::size_t kInvented = lgx::LogAnalyzer::kMaxBucketEntries + 10;
+    for (std::size_t i = 0; i < kInvented; ++i) {
+        line = "[2026-02-14 08:00:00.000] [INFO] [M";
+        line += std::to_string(i);
+        line += "] x\n";
+        a.feed(line.data(), line.size());
+    }
+    a.finish();
+    const std::string csv = a.make_csv();
+    CHECK(csv.find("aggregate_truncated,1") != std::string::npos);
+    CHECK(a.summary().find("AGGREGATE_TRUNCATED") != std::string::npos);
+
+    const auto clean = run(kOk1);
+    CHECK(clean.make_csv().find("aggregate_truncated,0") != std::string::npos);
+    CHECK(clean.summary().find("AGGREGATE_TRUNCATED") == std::string::npos);
+}
+
+void test_byda_envelope_diagnostic()
+{
+    // A damaged BYDA record must not be reported as a legacy timestamp fault.
+    const auto a = run(
+        "[2026-06-19_22:05:00.123456][7710][30482][1885246073 "
+        "BYDA::OpenBraceLeak: rfLane[3]\n");
+    CHECK_EQ(a.malformed_lines(), 1u);
+    CHECK(a.error_samples().size() == 1u);
+    CHECK(a.error_samples()[0].find("malformed BYDA record envelope") !=
+          std::string::npos);
+}
+
 void test_aggregate_table_hard_cap()
 {
     // Hostile input inventing endless unique modules must hit the cap
@@ -286,6 +355,10 @@ int main()
     test_spd_boundaries_and_duplicates();
     test_byda_assignment_format_and_poison();
     test_byda_strict_boundaries();
+    test_byda_payload_field_contract();
+    test_control_bytes_rejected_in_both_dialects();
+    test_aggregate_truncation_is_reported();
+    test_byda_envelope_diagnostic();
     test_aggregate_table_hard_cap();
 
     if (g_failures == 0) {

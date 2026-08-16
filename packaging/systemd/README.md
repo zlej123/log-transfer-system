@@ -39,16 +39,38 @@ journalctl -u log-transfer-server -f
 sudo systemctl stop log-transfer-server      # SIGTERM; uploads stay resumable
 ```
 
-Edit the `ExecStart` options (port, threads, queue, quotas, authorized client
-subject) with `sudo systemctl edit log-transfer-server` so the shipped unit
-stays untouched.
+Change options (port, threads, queue, quotas, authorized client subject) with
+`sudo systemctl edit log-transfer-server` so the shipped unit stays untouched.
+A drop-in **must** clear the inherited command first, otherwise the unit refuses
+to load with "Service has more than one ExecStart= setting":
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/log_server --port 45777 --workdir /var/lib/log-transfer     --cert /etc/log-transfer/server.crt --key /etc/log-transfer/server.key     --client-ca /etc/log-transfer/ca.crt --threads 8 --queue 64
+```
+
+Run `sudo systemd-analyze verify log-transfer-server.service` after editing: a
+bad drop-in leaves the running instance untouched, so the failure would
+otherwise stay hidden until the next start.
+
+If the unit stopped because the start limit tripped, restarting is not enough;
+clear the latch first:
+
+```bash
+sudo systemctl reset-failed log-transfer-server
+sudo systemctl start log-transfer-server
+```
+
+The limit window counts administrative restarts too, so a manual restart shortly
+before a crash can trip it earlier than five attempts.
 
 ## Behavior
 
 | Situation | Result |
 |---|---|
-| Missing or mismatched TLS material | Exits non-zero with the reason in the journal; after `StartLimitBurst` attempts the unit stops in `failed` instead of looping |
-| `systemctl stop` | `SIGTERM`, bounded pool drains, exit status 0, partial uploads remain resumable |
+| Missing or mismatched TLS material | Exits non-zero with the reason in the journal; after `StartLimitBurst` attempts the unit stops in `failed` instead of looping. Recover with `reset-failed` |
+| `systemctl stop` | `SIGTERM`, bounded pool drains, exit status 0, well inside `TimeoutStopSec`, partial uploads remain resumable |
 | Process crash | `Restart=on-failure` brings it back automatically |
 | Host reboot | `WantedBy=multi-user.target` starts it again |
 
@@ -67,8 +89,18 @@ Validated in an Ubuntu 24.04 container running systemd 255 as PID 1:
 
 - unit accepted by `systemd-analyze verify`
 - starts as the unprivileged `lgx` account with `/var/lib/log-transfer` at `0700`
-- real mutual-TLS transfer succeeds under the full sandbox
-- `systemctl stop` completes in 76 ms with `Result=success`
+- real mutual-TLS transfer succeeds under the full sandbox, so the syscall
+  filter does not block `signalfd`, `flock`, `poll` or TLS
+- `systemctl stop` returns `Result=success` with exit status 0, far inside the
+  60 s stop timeout
 - `SIGKILL` is followed by an automatic restart, and results stay identical
-- the service returns to `active` automatically after a reboot
-- with TLS material absent the unit ends in `failed` after 5 attempts
+- with TLS material absent the unit ends in `failed` after the configured
+  attempts, and `reset-failed` restores normal operation
+- the unit is `enabled` through `WantedBy=multi-user.target`, and the service
+  came back `active` on its own when the container's systemd was restarted
+
+Not verified: startup on a real machine reboot, which a container cannot
+reproduce.
+
+The server prints its own timestamp, so journal lines carry both the journal
+timestamp and the application timestamp.

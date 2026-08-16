@@ -101,7 +101,8 @@ See [`packaging/systemd/README.md`](packaging/systemd/README.md) for the service
 account, TLS material layout, sandbox settings and failure behavior.
 
 The private work directory and upload store use mode `0700`; daemon-created
-files inherit mode `0600`. `server.pid` is removed during graceful shutdown.
+files inherit mode `0600`. `server.pid` is written and removed only by
+`--daemon`; under systemd the supervisor tracks the process instead.
 
 ### 4. Generate and transfer a 500 MiB log
 
@@ -261,7 +262,8 @@ mutation are covered by automated tests.
 - 64 KiB receive/read buffer per active connection
 - 64 KiB maximum logical log line; an oversized line is discarded without
   accumulating its contents
-- 20,000 maximum module/hour aggregate keys per analyzer
+- 20,000 maximum module/hour aggregate keys per analyzer; the result reports
+  `aggregate_keys` and an explicit `aggregate_truncated` flag
 - 50 maximum poison samples retained in memory
 - bounded workers and queue
 - 8 GiB per-file protocol ceiling
@@ -276,7 +278,7 @@ Measured with the supplied `BYDA_Test_Log_500MB.log` (506,286,814 bytes):
 | Measurement | Result |
 |---|---:|
 | Linux server peak RSS (`VmHWM`) | **≤ 5.2 MiB** |
-| Client peak RSS | **≤ 4.7 MiB** |
+| Client peak RSS | **≤ 4.9 MiB** |
 | Full client operation (pre-hash + mTLS upload + verify/parse + result) | **6.7–9.34 s** |
 | Server SHA verification + streaming analysis | **2.09–2.25 s** |
 | Parsed records | **3,483,502 valid / 26 malformed** |

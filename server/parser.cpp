@@ -164,27 +164,44 @@ bool parse_byda_header(const char* s, std::size_t n, std::string& hour_key,
     return true;
 }
 
-// Known numeric payload fields are validated when they appear. This detects
-// alphabetic poison values without coupling the parser to a poison module name.
+inline bool is_name_char(char c)
+{
+    return is_digit(c) || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           c == '_';
+}
+
+// BYDA payloads are opaque text except for a documented contract: the fields
+// named below carry an unsigned integer. This is a declared schema for the
+// supplied dialect, not a generic corruption detector, and it deliberately does
+// not look at module names. A longer field that merely starts with one of these
+// names (rfLaneCount) is a different field and is left untouched.
+constexpr const char* kByda_integer_fields[] = {
+    "nodeUID", "rfLane", "sectorID", "bearing", "jobID", "unitAddr",
+    "gatedFlag", "element"
+};
+
 bool validate_integer_field(const char* msg, std::size_t n,
                             const char* label, std::size_t label_len)
 {
     for (std::size_t i = 0; i + label_len <= n; ++i) {
         if (std::memcmp(msg + i, label, label_len) != 0) continue;
-        if (i > 0) {
-            const char previous = msg[i - 1];
-            if (is_digit(previous) ||
-                (previous >= 'A' && previous <= 'Z') ||
-                (previous >= 'a' && previous <= 'z') || previous == '_')
-                continue;
-        }
+        if (i > 0 && is_name_char(msg[i - 1])) continue;      // left boundary
         std::size_t pos = i + label_len;
+        if (pos < n && is_name_char(msg[pos])) continue;      // right boundary
         if (pos >= n || msg[pos] != '[') return false;
         ++pos;
         const std::size_t start = pos;
         while (pos < n && is_digit(msg[pos])) ++pos;
         if (pos == start || pos >= n || msg[pos] != ']') return false;
     }
+    return true;
+}
+
+bool validate_byda_payload_fields(const char* msg, std::size_t n)
+{
+    for (const char* label : kByda_integer_fields)
+        if (!validate_integer_field(msg, n, label, std::strlen(label)))
+            return false;
     return true;
 }
 
@@ -300,6 +317,12 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     std::size_t off = 0;
     const bool byda_format = parse_byda_header(s, n, hour_key, module, off);
     if (!byda_format) {
+        // A line that carries the BYDA timestamp separator was meant to be a
+        // BYDA record, so report that instead of a misleading legacy error.
+        if (n > 11 && s[0] == '[' && s[11] == '_') {
+            mark_malformed(s, n, "malformed BYDA record envelope");
+            return;
+        }
         // Preserve the original generated/test format.
         if (!check_timestamp(s, n, hour_key)) {
             mark_malformed(s, n, "bad timestamp / missing bracket");
@@ -330,19 +353,18 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     // (validated before Task 1 so a corrupt line never pollutes any table)
     const char* msg = s + off;
     const std::size_t msg_len = n - off;
-    if (byda_format) {
-        for (std::size_t i = 0; i < msg_len; ++i) {
-            const unsigned char value = static_cast<unsigned char>(msg[i]);
-            if (value < 0x20 || value > 0x7E) {
-                mark_malformed(s, n, "non-printable payload byte");
-                return;
-            }
-        }
-        if (!validate_integer_field(msg, msg_len, "nodeUID", 7) ||
-            !validate_integer_field(msg, msg_len, "rfLane", 6)) {
-            mark_malformed(s, n, "invalid numeric payload field");
+    // A log record is text; control bytes mean the record is damaged. This is
+    // enforced for both dialects so neither is validated more weakly.
+    for (std::size_t i = 0; i < msg_len; ++i) {
+        const unsigned char value = static_cast<unsigned char>(msg[i]);
+        if ((value < 0x20 && value != '\t') || value > 0x7E) {
+            mark_malformed(s, n, "non-printable payload byte");
             return;
         }
+    }
+    if (byda_format && !validate_byda_payload_fields(msg, msg_len)) {
+        mark_malformed(s, n, "declared integer field carries a non-integer");
+        return;
     }
     bool has_spd = false;
     for (std::size_t i = 0; i + 3 <= msg_len; ++i) {
@@ -533,6 +555,8 @@ std::string LogAnalyzer::make_csv() const
 
     csv += "\n# Summary\n";
     csv += "metric,value\n";
+    csv += "aggregate_truncated," + std::string(bucket_overflow_ ? "1" : "0") + "\n";
+    csv += "aggregate_keys,"   + std::to_string(bucket_counts_.size()) + "\n";
     csv += "total_lines,"     + std::to_string(total_lines_)     + "\n";
     csv += "valid_lines,"     + std::to_string(valid_lines_)     + "\n";
     csv += "malformed_lines," + std::to_string(malformed_lines_) + "\n";
@@ -548,6 +572,7 @@ std::string LogAnalyzer::summary() const
     s += " malformed=" + std::to_string(malformed_lines_);
     s += " spd_lines=" + std::to_string(spd_count_);
     s += " buckets=" + std::to_string(bucket_counts_.size());
+    if (bucket_overflow_) s += " AGGREGATE_TRUNCATED";
     return s;
 }
 

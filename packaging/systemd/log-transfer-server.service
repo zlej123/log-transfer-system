@@ -27,7 +27,6 @@ ExecStart=/usr/local/bin/log_server \
 
 # The server drains its bounded pool on SIGTERM and leaves uploads resumable.
 KillSignal=SIGTERM
-KillMode=mixed
 TimeoutStopSec=60
 Restart=on-failure
 RestartSec=2s

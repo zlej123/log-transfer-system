@@ -11,6 +11,11 @@
 // bytes, format mismatches). Every validation failure is contained: the
 // line is counted, a sample is recorded, and parsing continues.
 //
+// Payload policy: a payload is opaque text apart from two declared rules --
+// it must be printable, and for the BYDA dialect the field names listed in
+// parser.cpp must carry unsigned integers. Corruption that stays inside those
+// rules is indistinguishable from data and is deliberately counted as valid.
+//
 // STRICT RULE COMPLIANT: std::string/std::vector with bounded state only.
 #pragma once
 
