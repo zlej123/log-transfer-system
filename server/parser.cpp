@@ -171,38 +171,54 @@ inline bool is_name_char(char c)
 }
 
 // BYDA payloads are opaque text except for a documented contract: the fields
-// named below carry an unsigned integer. This is a declared schema for the
+// named here carry an unsigned integer. This is a declared schema for the
 // supplied dialect, not a generic corruption detector, and it deliberately does
-// not look at module names. A longer field that merely starts with one of these
-// names (rfLaneCount) is a different field and is left untouched.
-constexpr const char* kByda_integer_fields[] = {
-    "nodeUID", "rfLane", "sectorID", "bearing", "jobID", "unitAddr",
-    "gatedFlag", "element"
-};
-
-bool validate_integer_field(const char* msg, std::size_t n,
-                            const char* label, std::size_t label_len)
+// not look at module names. Identifiers are matched whole, so a longer field
+// that merely starts with one of these names (rfLaneCount) is a different field.
+bool is_declared_integer_field(const char* name, std::size_t len)
 {
-    for (std::size_t i = 0; i + label_len <= n; ++i) {
-        if (std::memcmp(msg + i, label, label_len) != 0) continue;
-        if (i > 0 && is_name_char(msg[i - 1])) continue;      // left boundary
-        std::size_t pos = i + label_len;
-        if (pos < n && is_name_char(msg[pos])) continue;      // right boundary
-        if (pos >= n || msg[pos] != '[') return false;
-        ++pos;
-        const std::size_t start = pos;
-        while (pos < n && is_digit(msg[pos])) ++pos;
-        if (pos == start || pos >= n || msg[pos] != ']') return false;
+    switch (len) {
+    case 5: return std::memcmp(name, "jobID", 5) == 0;
+    case 6: return std::memcmp(name, "rfLane", 6) == 0;
+    case 7: return std::memcmp(name, "nodeUID", 7) == 0 ||
+                   std::memcmp(name, "bearing", 7) == 0 ||
+                   std::memcmp(name, "element", 7) == 0;
+    case 8: return std::memcmp(name, "sectorID", 8) == 0 ||
+                   std::memcmp(name, "unitAddr", 8) == 0;
+    case 9: return std::memcmp(name, "gatedFlag", 9) == 0;
+    default: return false;
     }
-    return true;
 }
 
-bool validate_byda_payload_fields(const char* msg, std::size_t n)
+enum class PayloadCheck { Ok, NonPrintable, BadIntegerField };
+
+// One pass over the payload validates both rules. Scanning per declared field
+// name instead would re-read the whole payload once per name, which dominated
+// analysis time on the 500 MB corpus.
+PayloadCheck check_payload(const char* msg, std::size_t n, bool byda_format)
 {
-    for (const char* label : kByda_integer_fields)
-        if (!validate_integer_field(msg, n, label, std::strlen(label)))
-            return false;
-    return true;
+    std::size_t i = 0;
+    while (i < n) {
+        const unsigned char value = static_cast<unsigned char>(msg[i]);
+        if (is_name_char(msg[i])) {
+            const std::size_t start = i;
+            while (i < n && is_name_char(msg[i])) ++i;   // maximal identifier
+            if (!byda_format) continue;
+            if (!is_declared_integer_field(msg + start, i - start)) continue;
+            if (i >= n || msg[i] != '[') return PayloadCheck::BadIntegerField;
+            const std::size_t digits = ++i;
+            while (i < n && is_digit(msg[i])) ++i;
+            if (i == digits || i >= n || msg[i] != ']')
+                return PayloadCheck::BadIntegerField;
+            ++i;
+            continue;
+        }
+        // A log record is text; control bytes mean the record is damaged.
+        if ((value < 0x20 && value != '\t') || value > 0x7E)
+            return PayloadCheck::NonPrintable;
+        ++i;
+    }
+    return PayloadCheck::Ok;
 }
 
 std::string escape_sample(const char* s, std::size_t n)
@@ -353,18 +369,17 @@ void LogAnalyzer::process_line(const char* s, std::size_t n)
     // (validated before Task 1 so a corrupt line never pollutes any table)
     const char* msg = s + off;
     const std::size_t msg_len = n - off;
-    // A log record is text; control bytes mean the record is damaged. This is
-    // enforced for both dialects so neither is validated more weakly.
-    for (std::size_t i = 0; i < msg_len; ++i) {
-        const unsigned char value = static_cast<unsigned char>(msg[i]);
-        if ((value < 0x20 && value != '\t') || value > 0x7E) {
-            mark_malformed(s, n, "non-printable payload byte");
-            return;
-        }
-    }
-    if (byda_format && !validate_byda_payload_fields(msg, msg_len)) {
+    // Both rules are enforced for both dialects in a single pass, so neither
+    // dialect is validated more weakly and the payload is read only once.
+    switch (check_payload(msg, msg_len, byda_format)) {
+    case PayloadCheck::NonPrintable:
+        mark_malformed(s, n, "non-printable payload byte");
+        return;
+    case PayloadCheck::BadIntegerField:
         mark_malformed(s, n, "declared integer field carries a non-integer");
         return;
+    case PayloadCheck::Ok:
+        break;
     }
     bool has_spd = false;
     for (std::size_t i = 0; i + 3 <= msg_len; ++i) {

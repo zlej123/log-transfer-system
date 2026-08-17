@@ -75,6 +75,10 @@ struct ServerConfig {
     std::size_t queue_capacity = 32;
     std::uint64_t max_reserved_bytes = 20ull * 1024 * 1024 * 1024;
     std::size_t max_partials = 100;
+    // Durable checkpoint interval. Each checkpoint costs fdatasync(spool) plus a
+    // synced manifest replace, so this trades steady-state upload throughput
+    // against how much of an interrupted upload must be resent.
+    std::uint64_t checkpoint_bytes = 16ull * 1024 * 1024;
     int resume_ttl_hours = 24;
     bool log_poison_samples = false;
 };
@@ -275,7 +279,7 @@ void handle_connection(ConnectionTask task, const ServerConfig& config,
                 }
                 current_offset += static_cast<std::uint64_t>(count);
                 since_checkpoint += static_cast<std::uint64_t>(count);
-                if (since_checkpoint >= 4ull * 1024 * 1024) {
+                if (since_checkpoint >= config.checkpoint_bytes) {
                     if (!spool.sync_data() ||
                         !store.checkpoint(upload, current_offset, error)) {
                         send_error(tls, lgx::ErrorCode::Storage,
@@ -442,6 +446,9 @@ int main(int argc, char** argv)
         } else if (argument == "--max-storage-gb" && i + 1 < argc) {
             config.max_reserved_bytes = static_cast<std::uint64_t>(
                 std::max(1, std::atoi(argv[++i]))) * 1024ull * 1024 * 1024;
+        } else if (argument == "--checkpoint-mb" && i + 1 < argc) {
+            config.checkpoint_bytes = static_cast<std::uint64_t>(
+                std::max(1, std::atoi(argv[++i]))) * 1024ull * 1024;
         } else if (argument == "--max-partials" && i + 1 < argc) {
             config.max_partials = static_cast<std::size_t>(std::max(1, std::atoi(argv[++i])));
         } else if (argument == "--resume-ttl-hours" && i + 1 < argc) {
@@ -457,7 +464,7 @@ int main(int argc, char** argv)
                 "  --cert FILE --key FILE --client-ca FILE\n"
                 "  --allowed-client-subject DN\n"
                 "  --threads N --queue N --max-storage-gb N --max-partials N\n"
-                "  --resume-ttl-hours N --log-poison-samples\n");
+                "  --resume-ttl-hours N --checkpoint-mb N --log-poison-samples\n");
             return 0;
         }
     }

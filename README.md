@@ -80,7 +80,7 @@ has subject `CN=lgx-client` and `clientAuth` EKU.
   --key certs/server.key \
   --client-ca certs/ca.crt \
   --allowed-client-subject "CN=lgx-client" \
-  --threads 4 --queue 32
+  --threads 4 --queue 32 --checkpoint-mb 16
 ```
 
 Daemon mode:
@@ -272,6 +272,11 @@ mutation are covered by automated tests.
 - completed+partial manifest count capped relative to the partial quota
 - 24-hour stale cache/partial cleanup at startup and new-session admission
   (`--resume-ttl-hours`)
+- 16 MiB durable checkpoint interval (`--checkpoint-mb`). Each checkpoint costs
+  an `fdatasync` plus a synced manifest replace, so this trades steady-state
+  upload throughput against how much of an upload a crash can lose. A graceful
+  disconnect always commits the received prefix, so the interval only bounds
+  what an abrupt process or power loss must resend.
 
 Measured with the supplied `BYDA_Test_Log_500MB.log` (506,286,814 bytes):
 
@@ -279,8 +284,9 @@ Measured with the supplied `BYDA_Test_Log_500MB.log` (506,286,814 bytes):
 |---|---:|
 | Linux server peak RSS (`VmHWM`) | **≤ 5.2 MiB** |
 | Client peak RSS | **≤ 4.9 MiB** |
-| Full client operation (pre-hash + mTLS upload + verify/parse + result) | **6.7–9.34 s** |
-| Server SHA verification + streaming analysis | **2.09–2.25 s** |
+| Full client operation (pre-hash + mTLS upload + verify/parse + result) | **4.6–5.6 s** |
+| Server SHA verification + streaming analysis | **1.54–1.59 s** |
+| Analyzer throughput (warm cache, parse only) | **846 MiB/s** |
 | Parsed records | **3,483,502 valid / 26 malformed** |
 | Speed records | **580,661; average 137,500.000000** |
 | Result correctness | all **125 module/hour buckets** equal an independent streaming oracle |
